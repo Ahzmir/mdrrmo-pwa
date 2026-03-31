@@ -28,7 +28,7 @@ const missingConfig = requiredConfig.filter((key) => !firebaseConfig[key]);
 if (missingConfig.length > 0) {
   throw new Error(
     `Missing Firebase environment values: ${missingConfig.join(", ")}. ` +
-      "Add them in your .env file."
+      "Add them in your .env file, then restart dev server or rebuild before deploy."
   );
 }
 

@@ -8,6 +8,10 @@
 : `VITE_CLOUDINARY_UPLOAD_PRESET` must be an **Unsigned** upload preset name (not API key/secret).
 4. Run `npm install` if needed, then `npm run dev`.
 
+Build/deploy note:
+- `npm run dev` and `npm run build` now run an env preflight check.
+- If deployment is built in CI, set the same `VITE_FIREBASE_*` variables in CI secrets/environment (because `.env` files are gitignored).
+
 Firebase is initialized in `src/lib/firebase.ts` and loaded from `src/main.tsx`.
 Resident sign-up verification files (ID/proof documents) and incident photos are uploaded to Cloudinary and stored as URLs.
 
