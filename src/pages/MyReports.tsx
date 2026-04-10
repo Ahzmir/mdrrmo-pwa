@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, ChevronDown, ChevronUp, Inbox, MapPin, Route } from "lucide-react";
+import { ArrowLeft, Inbox, MapPin, Route } from "lucide-react";
 import { useReports } from "@/hooks/useReports";
 import { CategoryIcon } from "@/components/CategoryIcon";
 import { StatusBadge } from "@/components/StatusBadge";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { db } from "@/lib/firebase";
-import { Timestamp, doc, onSnapshot } from "firebase/firestore";
+import { Timestamp, collection, doc, onSnapshot } from "firebase/firestore";
 import L from "leaflet";
 import { MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
@@ -25,6 +26,8 @@ type ResponderLiveRow = {
   lng: number;
   updatedAt: Date | null;
 };
+
+type ResponderNameDirectory = Map<string, string>;
 
 function toDate(value: unknown): Date | null {
   if (value instanceof Timestamp) return value.toDate();
@@ -57,72 +60,170 @@ function toLiveCoordinate(value: unknown) {
 export default function MyReports() {
   const navigate = useNavigate();
   const reports = useReports();
-  const [expandedReportId, setExpandedReportId] = useState<string | null>(null);
-  const [responderLiveRows, setResponderLiveRows] = useState<ResponderLiveRow[]>([]);
+  const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
+  const [liveByResponderId, setLiveByResponderId] = useState<Map<string, ResponderLiveRow>>(
+    () => new Map()
+  );
+  const [responderNames, setResponderNames] = useState<ResponderNameDirectory>(() => new Map());
 
-  const expandedReport = useMemo(
-    () => reports.find((report) => report.id === expandedReportId) || null,
-    [expandedReportId, reports]
+  const selectedReport = useMemo(
+    () => reports.find((report) => report.id === selectedReportId) || null,
+    [selectedReportId, reports]
   );
 
   useEffect(() => {
-    const assigned = expandedReport?.assignedResponders || [];
-    if (!expandedReport || assigned.length === 0) {
-      setResponderLiveRows([]);
-      return;
+    const respondersRef = collection(db, "responders");
+    const unsubscribe = onSnapshot(
+      respondersRef,
+      (snapshot) => {
+        const directory = new Map<string, string>();
+
+        snapshot.docs.forEach((responderDoc) => {
+          const data = responderDoc.data() as Record<string, unknown>;
+          const name =
+            typeof data.name === "string" && data.name.trim().length > 0
+              ? data.name.trim()
+              : "Responder";
+          const authUid =
+            typeof data.uid === "string" && data.uid.trim().length > 0
+              ? data.uid.trim()
+              : responderDoc.id;
+
+          directory.set(responderDoc.id, name);
+          directory.set(authUid, name);
+        });
+
+        setResponderNames(directory);
+      },
+      () => {
+        setResponderNames(new Map());
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
+  function normalizeDisplayName(value: string) {
+    const cleaned = value
+      .replace(/[_\-.]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!cleaned) {
+      return "";
     }
 
-    const liveByUid = new Map<string, ResponderLiveRow>();
-    const unsubs = assigned.map((uid) =>
-      onSnapshot(
-        doc(db, "responderLiveLocations", uid),
-        (snapshot) => {
-          if (!snapshot.exists()) {
-            liveByUid.delete(uid);
-            setResponderLiveRows(Array.from(liveByUid.values()));
-            return;
-          }
+    return cleaned
+      .split(" ")
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+  }
 
-          const data = snapshot.data() as Record<string, unknown>;
+  function toDisplayNameFromEmail(email: string) {
+    const atIndex = email.indexOf("@");
+    const local = atIndex > 0 ? email.slice(0, atIndex) : email;
+    return normalizeDisplayName(local);
+  }
+
+  function assignedResponderNames(report: {
+    assignedResponders?: string[];
+    assignedResponderNames?: string[];
+    assignedResponderEmails?: string[];
+  }) {
+    const explicitNames = (report.assignedResponderNames || [])
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0);
+    if (explicitNames.length > 0) {
+      return Array.from(new Set(explicitNames));
+    }
+
+    const assignedIds = report.assignedResponders || [];
+    if (assignedIds.length === 0) {
+      return [];
+    }
+
+    const directoryNames = assignedIds
+      .map((id) => responderNames.get(id))
+      .filter((name): name is string => !!name && name.trim().length > 0)
+      .map((name) => name.trim());
+
+    const emailNames = (report.assignedResponderEmails || [])
+      .map((email) => toDisplayNameFromEmail(email))
+      .filter((name) => name.length > 0);
+
+    const mergedNames = [...directoryNames, ...emailNames];
+    if (mergedNames.length > 0) {
+      return Array.from(new Set(mergedNames));
+    }
+
+    return ["Assigned responder"];
+  }
+
+  useEffect(() => {
+    const liveLocationsRef = collection(db, "responderLiveLocations");
+    const unsubscribe = onSnapshot(
+      liveLocationsRef,
+      (snapshot) => {
+        const next = new Map<string, ResponderLiveRow>();
+
+        snapshot.docs.forEach((liveDoc) => {
+          const data = liveDoc.data() as Record<string, unknown>;
           const coord = toLiveCoordinate(data.liveLocation);
           if (!coord) {
-            liveByUid.delete(uid);
-            setResponderLiveRows(Array.from(liveByUid.values()));
             return;
           }
 
-          liveByUid.set(uid, {
-            uid,
+          const uidFromDoc =
+            typeof data.uid === "string" && data.uid.trim().length > 0 ? data.uid.trim() : liveDoc.id;
+          const row: ResponderLiveRow = {
+            uid: uidFromDoc,
             lat: coord.lat,
             lng: coord.lng,
             updatedAt: toDate(data.liveLocationUpdatedAt),
-          });
-          setResponderLiveRows(Array.from(liveByUid.values()));
-        },
-        () => {
-          liveByUid.delete(uid);
-          setResponderLiveRows(Array.from(liveByUid.values()));
-        }
-      )
+          };
+
+          next.set(liveDoc.id, row);
+          next.set(uidFromDoc, row);
+        });
+
+        setLiveByResponderId(next);
+      },
+      () => {
+        setLiveByResponderId(new Map());
+      }
     );
 
-    return () => {
-      unsubs.forEach((unsubscribe) => unsubscribe());
-    };
-  }, [expandedReport]);
+    return () => unsubscribe();
+  }, []);
+
+  const responderLiveRows = useMemo(() => {
+    const assignedIds = selectedReport?.assignedResponders || [];
+    if (assignedIds.length === 0) {
+      return [] as ResponderLiveRow[];
+    }
+
+    const dedupedRows = new Map<string, ResponderLiveRow>();
+    assignedIds.forEach((id) => {
+      const row = liveByResponderId.get(id);
+      if (row) {
+        dedupedRows.set(row.uid, row);
+      }
+    });
+
+    return Array.from(dedupedRows.values());
+  }, [selectedReport?.assignedResponders, liveByResponderId]);
 
   return (
-    <div className="pb-24 px-4 pt-4 max-w-lg mx-auto">
-      <div className="flex items-center gap-3 mb-6">
+    <div className="mx-auto max-w-lg bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)] px-4 pt-4 pb-24 animate-fade-in">
+      <div className="mb-6 flex items-center gap-3 rounded-2xl border border-white/45 bg-white/45 px-3 py-3 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
         <button onClick={() => navigate(-1)} className="p-1 text-muted-foreground">
           <ArrowLeft size={22} />
         </button>
-        <h1 className="text-lg font-bold text-foreground">My Reports</h1>
+        <h1 className="text-lg font-bold text-orange-600">My Reports</h1>
       </div>
 
       {reports.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-20 text-center gap-3">
-          <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center">
+        <div className="flex flex-col items-center justify-center gap-3 rounded-2xl border border-white/45 bg-white/45 py-20 text-center shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
+          <div className="flex h-16 w-16 items-center justify-center rounded-full bg-white/65">
             <Inbox size={28} className="text-muted-foreground" />
           </div>
           <p className="text-sm text-muted-foreground">
@@ -130,138 +231,186 @@ export default function MyReports() {
           </p>
           <button
             onClick={() => navigate("/report")}
-            className="mt-2 bg-emergency text-emergency-foreground rounded-xl px-6 py-3 font-semibold text-sm"
+            className="mt-2 rounded-xl bg-orange-600 px-6 py-3 text-sm font-semibold text-white"
           >
             Report Now
           </button>
         </div>
       ) : (
         <div className="space-y-3">
-          {reports.map((r) => (
-            <div
-              key={r.id}
-              className="bg-card rounded-xl p-4 border space-y-2"
-            >
+          {reports.map((r) => {
+            const assignedNames = assignedResponderNames(r);
+            return (
+              <button
+                key={r.id}
+                onClick={() => setSelectedReportId(r.id)}
+                className="w-full space-y-2 rounded-xl border border-white/50 bg-white/60 p-4 text-left backdrop-blur-md transition-all hover:border-orange-300"
+              >
+                {assignedNames.length > 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    Assigned to: <span className="font-semibold text-foreground">{assignedNames.join(", ")}</span>
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">Assigned to: Waiting for assignment</p>
+                )}
+
+                <div className="flex items-center justify-between">
+                  <CategoryIcon category={r.category} size={18} showLabel />
+                  <StatusBadge status={r.status} />
+                </div>
+                {r.photoUrl && (
+                  <img
+                    src={r.photoUrl}
+                    alt="Reported incident"
+                    loading="lazy"
+                    className="w-full h-40 object-cover rounded-lg border"
+                  />
+                )}
+                {r.description && (
+                  <p className="text-sm text-foreground">{r.description}</p>
+                )}
+                <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                  <span>{r.location}</span>
+                  <span>
+                    {r.createdAt.toLocaleDateString()} {r.createdAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <Dialog open={!!selectedReport} onOpenChange={(open) => !open && setSelectedReportId(null)}>
+        <DialogContent className="w-[calc(100%-2rem)] max-h-[88vh] max-w-lg overflow-y-auto rounded-2xl border border-white/55 bg-white/90 backdrop-blur-xl">
+          {selectedReport ? (
+            <div className="space-y-3">
+              <DialogHeader>
+                <DialogTitle>Report Details</DialogTitle>
+              </DialogHeader>
+
+              <p className="text-[11px] text-muted-foreground">
+                Assigned Responder(s):{" "}
+                <span className="font-semibold text-foreground">
+                  {assignedResponderNames(selectedReport).length > 0
+                    ? assignedResponderNames(selectedReport).join(", ")
+                    : "None yet"}
+                </span>
+              </p>
+
               <div className="flex items-center justify-between">
-                <CategoryIcon category={r.category} size={18} showLabel />
-                <StatusBadge status={r.status} />
+                <CategoryIcon category={selectedReport.category} size={18} showLabel />
+                <StatusBadge status={selectedReport.status} />
               </div>
-              {r.photoUrl && (
+
+              {selectedReport.photoUrl && (
                 <img
-                  src={r.photoUrl}
+                  src={selectedReport.photoUrl}
                   alt="Reported incident"
                   loading="lazy"
-                  className="w-full h-40 object-cover rounded-lg border"
+                  className="h-40 w-full rounded-lg border object-cover"
                 />
               )}
-              {r.description && (
-                <p className="text-sm text-foreground">{r.description}</p>
+
+              {selectedReport.description && (
+                <p className="text-sm text-foreground">{selectedReport.description}</p>
               )}
+
               <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                <span>{r.location}</span>
+                <span>{selectedReport.location}</span>
                 <span>
-                  {r.createdAt.toLocaleDateString()} {r.createdAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  {selectedReport.createdAt.toLocaleDateString()} {selectedReport.createdAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                 </span>
               </div>
 
-              <button
-                onClick={() => setExpandedReportId((current) => (current === r.id ? null : r.id))}
-                className="mt-1 flex w-full items-center justify-between rounded-lg border bg-secondary/30 px-3 py-2 text-xs font-semibold text-foreground"
-              >
-                <span>View details and responder route</span>
-                {expandedReportId === r.id ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-              </button>
+              <div className="grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
+                <p>Report ID: <span className="font-semibold text-foreground">{selectedReport.id}</span></p>
+                <p>Assigned Responders: <span className="font-semibold text-foreground">{selectedReport.assignedResponders?.length || 0}</span></p>
+                <p>
+                  Last Update: <span className="font-semibold text-foreground">{(selectedReport.updatedAt || selectedReport.createdAt).toLocaleString()}</span>
+                </p>
+                <p>
+                  Resolved At: <span className="font-semibold text-foreground">{selectedReport.resolvedAt ? selectedReport.resolvedAt.toLocaleString() : "Not yet"}</span>
+                </p>
+              </div>
 
-              {expandedReportId === r.id && (
-                <div className="space-y-3 rounded-lg border bg-background p-3">
-                  <div className="grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
-                    <p>Report ID: <span className="font-semibold text-foreground">{r.id}</span></p>
-                    <p>Assigned Responders: <span className="font-semibold text-foreground">{r.assignedResponders?.length || 0}</span></p>
-                    <p>
-                      Last Update: <span className="font-semibold text-foreground">{(r.updatedAt || r.createdAt).toLocaleString()}</span>
-                    </p>
-                    <p>
-                      Resolved At: <span className="font-semibold text-foreground">{r.resolvedAt ? r.resolvedAt.toLocaleString() : "Not yet"}</span>
-                    </p>
+              {selectedReport.coordinates ? (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    <Route size={13} />
+                    Responder Route to Incident
                   </div>
 
-                  {r.coordinates ? (
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                        <Route size={13} />
-                        Responder Route to Incident
+                  {responderLiveRows.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      Waiting for assigned responder live location updates.
+                    </p>
+                  ) : (
+                    <>
+                      <div className="h-56 overflow-hidden rounded-lg border">
+                        <MapContainer
+                          center={[selectedReport.coordinates.lat, selectedReport.coordinates.lng]}
+                          zoom={13}
+                          scrollWheelZoom
+                          className="h-full w-full"
+                        >
+                          <TileLayer
+                            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                            attribution="&copy; OpenStreetMap contributors"
+                          />
+
+                          <Marker position={[selectedReport.coordinates.lat, selectedReport.coordinates.lng]}>
+                            <Popup>Your incident location</Popup>
+                          </Marker>
+
+                          {responderLiveRows.map((live) => (
+                            <Marker key={live.uid} position={[live.lat, live.lng]}>
+                              <Popup>
+                                <div className="text-xs">
+                                  <p className="font-semibold">
+                                    {responderNames.get(live.uid) || "Assigned responder"}
+                                  </p>
+                                  <p>
+                                    Updated: {live.updatedAt ? live.updatedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Unknown"}
+                                  </p>
+                                </div>
+                              </Popup>
+                            </Marker>
+                          ))}
+
+                          {responderLiveRows.map((live) => (
+                            <Polyline
+                              key={`${live.uid}-route`}
+                              positions={[
+                                [live.lat, live.lng],
+                                [selectedReport.coordinates!.lat, selectedReport.coordinates!.lng],
+                              ]}
+                              pathOptions={{ color: "#0284c7", weight: 4, dashArray: "6 6" }}
+                            />
+                          ))}
+                        </MapContainer>
                       </div>
 
-                      {responderLiveRows.length === 0 ? (
-                        <p className="text-xs text-muted-foreground">
-                          Waiting for assigned responder live location updates.
-                        </p>
-                      ) : (
-                        <>
-                          <div className="h-56 overflow-hidden rounded-lg border">
-                            <MapContainer
-                              center={[r.coordinates.lat, r.coordinates.lng]}
-                              zoom={13}
-                              scrollWheelZoom
-                              className="h-full w-full"
-                            >
-                              <TileLayer
-                                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                                attribution="&copy; OpenStreetMap contributors"
-                              />
-
-                              <Marker position={[r.coordinates.lat, r.coordinates.lng]}>
-                                <Popup>Your incident location</Popup>
-                              </Marker>
-
-                              {responderLiveRows.map((live) => (
-                                <Marker key={live.uid} position={[live.lat, live.lng]}>
-                                  <Popup>
-                                    <div className="text-xs">
-                                      <p className="font-semibold">Responder {live.uid.slice(0, 6)}</p>
-                                      <p>
-                                        Updated: {live.updatedAt ? live.updatedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Unknown"}
-                                      </p>
-                                    </div>
-                                  </Popup>
-                                </Marker>
-                              ))}
-
-                              {responderLiveRows.map((live) => (
-                                <Polyline
-                                  key={`${live.uid}-route`}
-                                  positions={[
-                                    [live.lat, live.lng],
-                                    [r.coordinates!.lat, r.coordinates!.lng],
-                                  ]}
-                                  pathOptions={{ color: "#0284c7", weight: 4, dashArray: "6 6" }}
-                                />
-                              ))}
-                            </MapContainer>
+                      <div className="space-y-1">
+                        {responderLiveRows.map((live) => (
+                          <div key={`${live.uid}-meta`} className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                            <MapPin size={12} />
+                            <span>
+                              {responderNames.get(live.uid) || "Assigned responder"} at {live.lat.toFixed(5)}, {live.lng.toFixed(5)}
+                            </span>
                           </div>
-
-                          <div className="space-y-1">
-                            {responderLiveRows.map((live) => (
-                              <div key={`${live.uid}-meta`} className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                                <MapPin size={12} />
-                                <span>
-                                  Responder {live.uid.slice(0, 6)} at {live.lat.toFixed(5)}, {live.lng.toFixed(5)}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-muted-foreground">Incident coordinates are unavailable.</p>
+                        ))}
+                      </div>
+                    </>
                   )}
                 </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">Incident coordinates are unavailable.</p>
               )}
             </div>
-          ))}
-        </div>
-      )}
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -69,6 +69,18 @@ export function useReports() {
             ? (data.assignedResponders as unknown[])
                 .filter((entry): entry is string => typeof entry === "string")
             : [];
+          const assignedResponderNames = Array.isArray(data.assignedResponderNames)
+            ? (data.assignedResponderNames as unknown[])
+                .filter((entry): entry is string => typeof entry === "string")
+                .map((name) => name.trim())
+                .filter((name) => name.length > 0)
+            : [];
+          const assignedResponderEmails = Array.isArray(data.assignedResponderEmails)
+            ? (data.assignedResponderEmails as unknown[])
+                .filter((entry): entry is string => typeof entry === "string")
+                .map((email) => email.trim().toLowerCase())
+                .filter((email) => email.length > 0)
+            : [];
 
           return {
             id: incidentDoc.id,
@@ -82,6 +94,8 @@ export function useReports() {
             photoUrl: typeof data.photoUrl === "string" ? data.photoUrl : undefined,
             status: normalizedStatus,
             assignedResponders,
+            assignedResponderNames,
+            assignedResponderEmails,
             resolvedAt: toDate(data.resolvedAt),
             updatedAt: toDate(data.updatedAt),
             createdAt,

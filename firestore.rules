@@ -37,7 +37,7 @@ service cloud.firestore {
         && request.resource.data.uid == resource.data.uid
         && request.resource.data.email == resource.data.email
         && request.resource.data.role == resource.data.role;
-      allow delete: if false;
+      allow delete: if isAdmin();
     }
 
     // Resident account profiles created during sign-up.
@@ -101,7 +101,7 @@ service cloud.firestore {
               && request.resource.data.rejectionReason == null)
           )
         );
-      allow delete: if false;
+      allow delete: if isAdmin();
     }
 
     match /responders/{uid} {

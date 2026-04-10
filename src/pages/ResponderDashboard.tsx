@@ -2,28 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { useIncidents } from "@/hooks/useIncidents";
-import { acceptIncident, rejectIncident, updateIncidentStatus, updateResponderDutyStatus } from "@/stores/incidentStore";
 import { CategoryIcon } from "@/components/CategoryIcon";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SmsFallback } from "@/components/SmsFallback";
 import { auth, db } from "@/lib/firebase";
 import { Timestamp, collection, doc, limit, onSnapshot, query, serverTimestamp, setDoc, updateDoc, where } from "firebase/firestore";
 import {
-  LogOut,
-  Navigation,
-  CheckCircle2,
-  X,
-  Truck,
-  MapPin,
-  Clock,
   AlertTriangle,
   LocateFixed,
+  MapPin,
 } from "lucide-react";
-import { IncidentReport, ReportStatus } from "@/types/incident";
+import { IncidentReport } from "@/types/incident";
 import { cn } from "@/lib/utils";
-import { toast } from "sonner";
-
-type ResponderDutyStatus = "Available" | "Deployed" | "Off-Duty";
 
 function toDate(value: unknown): Date | null {
   if (value instanceof Timestamp) return value.toDate();
@@ -125,45 +115,23 @@ async function patchResponderLocationViaRest(
   }
 }
 
-const statusActions: { status: ReportStatus; icon: typeof Truck; label: string; color: string }[] = [
-  { status: "en_route", icon: Truck, label: "En Route", color: "bg-info text-info-foreground" },
-  { status: "on_scene", icon: MapPin, label: "On Scene", color: "bg-warning text-warning-foreground" },
-  { status: "resolved", icon: CheckCircle2, label: "Resolved", color: "bg-success text-success-foreground" },
-];
-
 function IncidentCard({
   incident,
   onViewDetails,
-  onAccept,
-  onDecline,
-  onUpdateStatus,
 }: {
   incident: IncidentReport;
   onViewDetails?: () => void;
-  onAccept: (incidentId: string) => Promise<void>;
-  onDecline: (incidentId: string) => Promise<void>;
-  onUpdateStatus: (incidentId: string, status: ReportStatus) => Promise<void>;
 }) {
   const canViewDetails = !!incident.coordinates;
 
-  function runAction(action: () => void | Promise<void>) {
-    return (event: React.MouseEvent<HTMLButtonElement>) => {
-      event.stopPropagation();
-      void Promise.resolve(action()).catch((error) => {
-        toast.error((error as Error).message || "Unable to update incident.");
-      });
-    };
-  }
-
   const awaitingDecision = incident.responderAssignmentStatus === "assigned";
-  const canProgressStatus = incident.responderAssignmentStatus === "accepted";
 
   return (
     <div
       onClick={canViewDetails ? onViewDetails : undefined}
       className={cn(
-        "bg-card rounded-xl border p-4 space-y-3 transition-all",
-        canViewDetails && "cursor-pointer hover:border-info/40 hover:shadow-sm",
+        "space-y-3 rounded-xl border border-white/55 bg-white/60 p-4 backdrop-blur-md transition-all",
+        canViewDetails && "cursor-pointer hover:border-orange-300 hover:shadow-sm",
         awaitingDecision && "border-emergency/40 ring-2 ring-emergency/10"
       )}
     >
@@ -180,103 +148,30 @@ function IncidentCard({
         <StatusBadge status={incident.status} />
       </div>
 
-      {/* Description */}
-      <p className="text-sm text-foreground leading-relaxed">{incident.description}</p>
+      {incident.photoUrl ? (
+        <img
+          src={incident.photoUrl}
+          alt="Resident incident attachment"
+          className="h-40 w-full rounded-lg border border-white/60 object-cover"
+          loading="lazy"
+        />
+      ) : null}
 
-      {/* Location */}
-      <div className="flex items-start gap-2 text-xs text-muted-foreground">
-        <MapPin size={14} className="mt-0.5 shrink-0" />
-        <span>{incident.location}</span>
+      <p className="text-sm text-foreground line-clamp-2">{incident.description}</p>
+
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <MapPin size={13} className="shrink-0" />
+        <span className="truncate">{incident.location}</span>
       </div>
 
-      {/* Time */}
-      <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-        <Clock size={12} />
-        <span>
-          {incident.createdAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-          {" · "}
-          {Math.round((Date.now() - incident.createdAt.getTime()) / 60000)} min ago
-        </span>
-      </div>
-
-      {/* Actions */}
-      <div className="flex flex-wrap gap-2 pt-1">
-        {/* Navigate */}
-        {incident.coordinates && onViewDetails && (
-          <button
-            onClick={runAction(onViewDetails)}
-            className="flex items-center gap-1.5 bg-info text-info-foreground rounded-xl px-3 py-2 text-xs font-semibold"
-          >
-            <Navigation size={14} />
-            Navigate (Geoapify)
-          </button>
-        )}
-
-        {canViewDetails && onViewDetails && (
-          <button
-            onClick={runAction(onViewDetails)}
-            className="flex items-center gap-1.5 bg-secondary text-foreground rounded-xl px-3 py-2 text-xs font-semibold"
-          >
-            <MapPin size={14} />
-            View Details
-          </button>
-        )}
-
-        {/* Status updates */}
-        {incident.status !== "resolved" &&
-          canProgressStatus &&
-          statusActions
-            .filter((a) => {
-              if (incident.status === "assigned") return a.status === "en_route";
-              if (incident.status === "en_route") return a.status === "on_scene";
-              if (incident.status === "on_scene") return a.status === "resolved";
-              return false;
-            })
-            .map((a) => {
-              const Icon = a.icon;
-              return (
-                <button
-                  key={a.status}
-                  onClick={runAction(() => onUpdateStatus(incident.id, a.status))}
-                  className={cn(
-                    "flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold",
-                    a.color
-                  )}
-                >
-                  <Icon size={14} />
-                  {a.label}
-                </button>
-              );
-            })}
-
-        {awaitingDecision && (
-          <button
-            onClick={runAction(() => onAccept(incident.id))}
-            className="flex items-center gap-1.5 bg-info text-info-foreground rounded-xl px-3 py-2 text-xs font-semibold"
-          >
-            <CheckCircle2 size={14} />
-            Yes, Accept
-          </button>
-        )}
-
-        {/* Reject assignment request */}
-        {awaitingDecision && (
-          <button
-            onClick={runAction(() => onDecline(incident.id))}
-            className="flex items-center gap-1.5 bg-muted text-muted-foreground rounded-xl px-3 py-2 text-xs font-semibold"
-          >
-            <X size={14} />
-            No, Reject
-          </button>
-        )}
-      </div>
+      <p className="text-xs text-muted-foreground">Tap to view incident details and respond.</p>
     </div>
   );
 }
 
 export default function ResponderDashboard() {
   const navigate = useNavigate();
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   const incidents = useIncidents();
   const active = incidents.filter((i) => i.status !== "resolved");
   const resolved = incidents.filter((i) => i.status === "resolved");
@@ -290,8 +185,6 @@ export default function ResponderDashboard() {
   const [syncLogLines, setSyncLogLines] = useState<string[]>([]);
   const [lastSuccessfulSyncAt, setLastSuccessfulSyncAt] = useState<Date | null>(null);
   const [nowTick, setNowTick] = useState(Date.now());
-  const [responderDutyStatus, setResponderDutyStatus] = useState<ResponderDutyStatus | null>(null);
-  const [isUpdatingDutyStatus, setIsUpdatingDutyStatus] = useState(false);
   const syncInFlightRef = useRef(false);
 
   const appendSyncLog = useCallback((message: string) => {
@@ -315,78 +208,6 @@ export default function ResponderDashboard() {
 
     return () => window.clearInterval(intervalId);
   }, []);
-
-  useEffect(() => {
-    if (!responderUid) {
-      setResponderDutyStatus(null);
-      return;
-    }
-
-    const directResponderRef = doc(db, "responders", responderUid);
-    const byUidQuery = query(collection(db, "responders"), where("uid", "==", responderUid), limit(1));
-    let fallbackUnsubscribe: (() => void) | null = null;
-
-    const applySnapshot = (snapshot: { exists: () => boolean; data: () => Record<string, unknown> }) => {
-      if (!snapshot.exists()) {
-        return;
-      }
-
-      const data = snapshot.data();
-      const status = data.status;
-      if (status === "Available" || status === "Deployed" || status === "Off-Duty") {
-        setResponderDutyStatus(status);
-      }
-    };
-
-    const subscribeFallback = () => {
-      if (fallbackUnsubscribe) {
-        return;
-      }
-
-      fallbackUnsubscribe = onSnapshot(byUidQuery, (querySnapshot) => {
-        if (querySnapshot.empty) {
-          return;
-        }
-
-        const first = querySnapshot.docs[0];
-        const data = first.data() as Record<string, unknown>;
-        const status = data.status;
-        if (status === "Available" || status === "Deployed" || status === "Off-Duty") {
-          setResponderDutyStatus(status);
-        }
-      });
-    };
-
-    const unsubscribe = onSnapshot(
-      directResponderRef,
-      (snapshot) => {
-        if (!snapshot.exists()) {
-          subscribeFallback();
-          return;
-        }
-
-        applySnapshot(snapshot as { exists: () => boolean; data: () => Record<string, unknown> });
-      },
-      () => {
-        subscribeFallback();
-      }
-    );
-
-    return () => {
-      try {
-        unsubscribe();
-      } catch {
-        // Guard against Firestore SDK assertion during teardown.
-      }
-      if (fallbackUnsubscribe) {
-        try {
-          fallbackUnsubscribe();
-        } catch {
-          // Guard against Firestore SDK assertion during teardown.
-        }
-      }
-    };
-  }, [responderUid]);
 
   useEffect(() => {
     if (!responderUid) {
@@ -421,7 +242,6 @@ export default function ResponderDashboard() {
               lastSuccessfulSyncAt !== null && nowTick - lastSuccessfulSyncAt.getTime() <= 60000;
 
             if (!hasRecentSuccessfulSync) {
-              setLastLiveUpdate(null);
               setHasLiveCoordinates(false);
             }
             setLocationStatusError("Responder profile not found.");
@@ -447,7 +267,7 @@ export default function ResponderDashboard() {
 
           if (hasCoords || !hasRecentSuccessfulSync) {
             setHasLiveCoordinates(hasCoords);
-            setLastLiveUpdate(nextLastUpdate);
+            setLastLiveUpdate((previous) => nextLastUpdate ?? previous);
           }
 
           if (hasCoords && nextLastUpdate) {
@@ -459,7 +279,6 @@ export default function ResponderDashboard() {
         (error) => {
           const code = (error as { code?: string }).code || "unknown";
           appendSyncLog(`Legacy listener error (${code}): ${error.message || "no message"}`);
-          setLastLiveUpdate(null);
           setHasLiveCoordinates(false);
           setLocationStatusError(error.message || "Unable to read responder location status.");
           setLocationDocLoading(false);
@@ -493,7 +312,7 @@ export default function ResponderDashboard() {
 
         if (hasCoords || !hasRecentSuccessfulSync) {
           setHasLiveCoordinates(hasCoords);
-          setLastLiveUpdate(nextLastUpdate);
+          setLastLiveUpdate((previous) => nextLastUpdate ?? previous);
         }
 
         if (hasCoords && nextLastUpdate) {
@@ -511,7 +330,6 @@ export default function ResponderDashboard() {
         }
 
         appendSyncLog(`Live-location listener error (${code || "unknown"}): ${error.message || "no message"}`);
-        setLastLiveUpdate(null);
         setHasLiveCoordinates(false);
         setLocationStatusError(error.message || "Unable to read responder location status.");
         setLocationDocLoading(false);
@@ -774,96 +592,17 @@ export default function ResponderDashboard() {
     return { label: "Live location stale, attempting to resync", tone: "text-warning" };
   }, [hasLiveCoordinates, lastLiveUpdate, lastSuccessfulSyncAt, locationDocLoading, locationStatusError, locationSyncError, nowTick]);
 
-  async function handleAcceptIncident(incidentId: string) {
-    console.info("[ResponderDashboard] Accept tapped", { incidentId });
-    await acceptIncident(incidentId);
-    toast.success("Incident accepted.");
-  }
-
-  async function handleDeclineIncident(incidentId: string) {
-    const reason = window.prompt("Reason for rejecting this incident:", "");
-    if (reason === null) {
-      return;
-    }
-
-    const trimmedReason = reason.trim();
-    if (!trimmedReason) {
-      toast.error("Please provide a rejection reason.");
-      return;
-    }
-
-    await rejectIncident(incidentId, trimmedReason);
-    toast.success("Incident declined.");
-  }
-
-  async function handleUpdateIncidentStatus(incidentId: string, status: ReportStatus) {
-    console.info("[ResponderDashboard] Status toggle tapped", { incidentId, status });
-    await updateIncidentStatus(incidentId, status);
-    if (status === "resolved") {
-      setResponderDutyStatus("Available");
-    }
-    toast.success("Incident status updated.");
-  }
-
-  async function handleSetDutyStatus(nextStatus: "Available" | "Off-Duty") {
-    if (responderDutyStatus === nextStatus) {
-      return;
-    }
-
-    setIsUpdatingDutyStatus(true);
-    try {
-      await updateResponderDutyStatus(nextStatus);
-      setResponderDutyStatus(nextStatus);
-      toast.success(`Responder status set to ${nextStatus}.`);
-    } catch (error) {
-      const message =
-        (error as { code?: string }).code === "permission-denied"
-          ? "Permission denied while updating status. Please refresh and try again."
-          : (error as Error).message || "Unable to update responder status.";
-      toast.error(message);
-    } finally {
-      setIsUpdatingDutyStatus(false);
-    }
-  }
-
-  async function handleLogout() {
-    await logout();
-    navigate("/login", { replace: true });
-  }
-
   return (
-    <div className="pb-8 px-4 pt-4 max-w-lg mx-auto">
+    <div className="mx-auto max-w-lg bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)] px-4 pt-4 pb-24">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="mb-6 rounded-2xl border border-white/45 bg-white/45 p-4 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
         <div>
           <p className="text-xs text-muted-foreground font-medium">Responder</p>
-          <h1 className="text-lg font-bold text-foreground">{user?.name}</h1>
+          <h1 className="text-lg font-bold text-orange-600">{user?.name}</h1>
         </div>
-        <button
-          onClick={() => void handleLogout()}
-          className="p-2 text-muted-foreground hover:text-foreground rounded-lg"
-        >
-          <LogOut size={20} />
-        </button>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-3 gap-2 mb-6">
-        {[
-          { label: "Active", count: active.length, color: "text-emergency" },
-          { label: "En Route", count: incidents.filter((i) => i.status === "en_route").length, color: "text-info" },
-          { label: "Resolved", count: resolved.length, color: "text-success" },
-        ].map((s) => (
-          <div key={s.label} className="bg-card rounded-xl border p-3 text-center">
-            <p className={cn("text-2xl font-black", s.color)}>{s.count}</p>
-            <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">
-              {s.label}
-            </p>
-          </div>
-        ))}
-      </div>
-
-      <div className="mb-6 rounded-xl border bg-card p-3">
+      <div className="mb-6 rounded-xl border border-white/55 bg-white/60 p-3 backdrop-blur-md">
         <div className="flex items-center gap-2">
           <LocateFixed size={16} className={cn(locationSharingState.tone)} />
           <p className={cn("text-sm font-semibold", locationSharingState.tone)}>
@@ -878,63 +617,21 @@ export default function ResponderDashboard() {
         {syncingLocation && <p className="mt-1 text-[11px] text-muted-foreground">Updating live location...</p>}
       </div>
 
-      <div className="mb-6 rounded-xl border bg-card p-3">
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-sm font-semibold text-foreground">
-            Duty Status: <span className="font-bold">{responderDutyStatus || "Unknown"}</span>
-          </p>
-          {responderDutyStatus === "Deployed" && (
-            <span className="rounded-full bg-info/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-info">
-              On Incident
-            </span>
-          )}
-        </div>
-        <div className="mt-3 flex gap-2">
-          <button
-            onClick={() => void handleSetDutyStatus("Available")}
-            disabled={isUpdatingDutyStatus || responderDutyStatus === "Deployed"}
-            className={cn(
-              "rounded-lg px-3 py-2 text-xs font-semibold",
-              responderDutyStatus === "Available" ? "bg-success text-success-foreground" : "bg-secondary text-foreground",
-              (isUpdatingDutyStatus || responderDutyStatus === "Deployed") && "opacity-60"
-            )}
-          >
-            Available
-          </button>
-          <button
-            onClick={() => void handleSetDutyStatus("Off-Duty")}
-            disabled={isUpdatingDutyStatus || responderDutyStatus === "Deployed"}
-            className={cn(
-              "rounded-lg px-3 py-2 text-xs font-semibold",
-              responderDutyStatus === "Off-Duty" ? "bg-muted text-foreground" : "bg-secondary text-foreground",
-              (isUpdatingDutyStatus || responderDutyStatus === "Deployed") && "opacity-60"
-            )}
-          >
-            Off-Duty
-          </button>
-        </div>
-        {responderDutyStatus === "Deployed" && (
-          <p className="mt-2 text-[11px] text-muted-foreground">
-            Status switches are disabled while assigned to an active incident.
-          </p>
-        )}
-      </div>
-
       {/* Active Incidents */}
       <div className="mb-6">
         <div className="flex items-center gap-2 mb-3">
-          <AlertTriangle size={16} className="text-emergency" />
+          <AlertTriangle size={16} className="text-orange-600" />
           <h2 className="text-sm font-bold text-foreground uppercase tracking-wider">
             Active Incidents
           </h2>
           {active.length > 0 && (
-            <span className="bg-emergency text-emergency-foreground text-[10px] font-bold px-2 py-0.5 rounded-full">
+            <span className="rounded-full bg-orange-600 px-2 py-0.5 text-[10px] font-bold text-white">
               {active.length}
             </span>
           )}
         </div>
         {active.length === 0 ? (
-          <div className="text-center py-10 text-sm text-muted-foreground">
+          <div className="rounded-xl border border-white/55 bg-white/55 py-10 text-center text-sm text-muted-foreground backdrop-blur-md">
             No active incidents. Stand by.
           </div>
         ) : (
@@ -944,9 +641,6 @@ export default function ResponderDashboard() {
                 key={inc.id}
                 incident={inc}
                 onViewDetails={() => navigate(`/responder/incidents/${inc.id}`)}
-                onAccept={handleAcceptIncident}
-                onDecline={handleDeclineIncident}
-                onUpdateStatus={handleUpdateIncidentStatus}
               />
             ))}
           </div>
@@ -961,7 +655,7 @@ export default function ResponderDashboard() {
           </h2>
           <div className="space-y-2">
             {resolved.map((inc) => (
-              <div key={inc.id} className="bg-card rounded-xl border p-3 opacity-60">
+              <div key={inc.id} className="rounded-xl border border-white/55 bg-white/55 p-3 opacity-60 backdrop-blur-md">
                 <div className="flex items-center justify-between">
                   <CategoryIcon category={inc.category} size={16} showLabel />
                   <StatusBadge status={inc.status} />
@@ -973,18 +667,6 @@ export default function ResponderDashboard() {
         </div>
       )}
 
-      {/* SMS Fallback for Responder */}
-      <div className="rounded-xl border-2 border-dashed border-warning bg-warning-light p-4">
-        <h3 className="font-bold text-sm text-warning-foreground mb-2">Status Update via SMS</h3>
-        <div className="bg-card rounded-lg p-3 font-mono text-xs border">
-          <span className="text-info font-bold">STATUS</span>{" "}
-          <span className="text-muted-foreground">&lt;incident_id&gt;</span>{" "}
-          <span className="text-success font-bold">EN_ROUTE</span>
-        </div>
-        <p className="text-[10px] text-muted-foreground mt-2">
-          Send to: <span className="font-semibold text-foreground">911-RESP</span> · Statuses: EN_ROUTE, ON_SCENE, RESOLVED
-        </p>
-      </div>
     </div>
   );
 }

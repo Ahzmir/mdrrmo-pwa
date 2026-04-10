@@ -1,17 +1,17 @@
-import { Home, PlusCircle, ClipboardList, Settings } from "lucide-react";
+import { LayoutDashboard, History, Activity, Settings } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { cn } from "@/lib/utils";
 
 const tabs = [
-  { path: "/", icon: Home, label: "Home" },
-  { path: "/report", icon: PlusCircle, label: "Report" },
-  { path: "/my-reports", icon: ClipboardList, label: "My Reports" },
+  { path: "/responder", icon: LayoutDashboard, label: "Dashboard" },
+  { path: "/responder/history", icon: History, label: "History" },
+  { path: "/responder/status", icon: Activity, label: "Status" },
 ];
 
-export function BottomNav() {
+export function ResponderNav() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
-  const settingsActive = pathname === "/settings";
+  const settingsActive = pathname === "/responder/settings";
 
   return (
     <nav className="fixed inset-x-0 bottom-3 z-50 px-3 safe-area-pb">
@@ -23,25 +23,23 @@ export function BottomNav() {
               key={path}
               onClick={() => navigate(path)}
               className={cn(
-                "flex min-w-[64px] flex-col items-center gap-0.5 rounded-lg px-4 py-1 transition-colors",
-                active
-                  ? "text-orange-600"
-                  : "text-muted-foreground hover:text-foreground"
+                "flex min-w-[64px] flex-col items-center gap-0.5 rounded-lg px-3 py-1 transition-colors",
+                active ? "text-orange-600" : "text-muted-foreground hover:text-foreground"
               )}
             >
-              <Icon size={22} strokeWidth={active ? 2.5 : 2} />
+              <Icon size={20} strokeWidth={active ? 2.5 : 2} />
               <span className="text-[10px] font-medium">{label}</span>
             </button>
           );
         })}
         <button
-          onClick={() => navigate("/settings")}
+          onClick={() => navigate("/responder/settings")}
           className={cn(
-            "flex min-w-[64px] flex-col items-center gap-0.5 rounded-lg px-4 py-1 transition-colors",
+            "flex min-w-[64px] flex-col items-center gap-0.5 rounded-lg px-3 py-1 transition-colors",
             settingsActive ? "text-orange-600" : "text-muted-foreground hover:text-foreground"
           )}
         >
-          <Settings size={22} strokeWidth={settingsActive ? 2.5 : 2} />
+          <Settings size={20} strokeWidth={settingsActive ? 2.5 : 2} />
           <span className="text-[10px] font-medium">Settings</span>
         </button>
       </div>

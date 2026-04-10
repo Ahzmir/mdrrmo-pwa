@@ -16,6 +16,8 @@ export interface IncidentReport {
   photoUrl?: string;
   status: ReportStatus;
   assignedResponders?: string[];
+  assignedResponderNames?: string[];
+  assignedResponderEmails?: string[];
   resolvedAt?: Date | null;
   updatedAt?: Date | null;
   responderAssignmentStatus?: "assigned" | "accepted" | "rejected";

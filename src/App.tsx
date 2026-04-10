@@ -1,32 +1,42 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes, Navigate } from "react-router-dom";
+import { BrowserRouter, Route, Routes, Navigate, useLocation } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { BottomNav } from "@/components/BottomNav";
+import { ResponderNav } from "@/components/ResponderNav";
 import { OfflineIndicator } from "@/components/OfflineIndicator";
 import Login from "@/pages/Login";
 import ResidentSignUp from "@/pages/ResidentSignUp";
 import Home from "@/pages/Home";
+import Settings from "@/pages/Settings";
 import ReportForm from "@/pages/ReportForm";
 import MyReports from "@/pages/MyReports";
 import ResponderDashboard from "@/pages/ResponderDashboard";
+import ResponderHistory from "@/pages/ResponderHistory";
+import ResponderStatus from "@/pages/ResponderStatus";
 import ResponderIncidentDetails from "@/pages/ResponderIncidentDetails";
+import ResponderSettings from "@/pages/ResponderSettings";
+import ForgotPassword from "@/pages/ForgotPassword";
 import NotFound from "@/pages/NotFound";
 
 const queryClient = new QueryClient();
 
 function AppRoutes() {
   const { user } = useAuth();
+  const { pathname } = useLocation();
   const isResident = user?.role === "resident";
+  const isResponder = user?.role === "responder";
+  const showResponderNav = isResponder && !pathname.startsWith("/responder/incidents/");
 
   return (
     <div className="min-h-screen bg-background">
       <OfflineIndicator />
       <Routes>
         <Route path="/login" element={<Login />} />
+        <Route path="/forgot-password" element={<ForgotPassword />} />
         <Route path="/signup-resident" element={<ResidentSignUp />} />
 
         {/* Resident routes */}
@@ -54,6 +64,14 @@ function AppRoutes() {
             </ProtectedRoute>
           }
         />
+        <Route
+          path="/settings"
+          element={
+            <ProtectedRoute allowedRoles={["resident"]}>
+              <Settings />
+            </ProtectedRoute>
+          }
+        />
 
         {/* Responder routes */}
         <Route
@@ -61,6 +79,30 @@ function AppRoutes() {
           element={
             <ProtectedRoute allowedRoles={["responder"]}>
               <ResponderDashboard />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/responder/history"
+          element={
+            <ProtectedRoute allowedRoles={["responder"]}>
+              <ResponderHistory />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/responder/status"
+          element={
+            <ProtectedRoute allowedRoles={["responder"]}>
+              <ResponderStatus />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/responder/settings"
+          element={
+            <ProtectedRoute allowedRoles={["responder"]}>
+              <ResponderSettings />
             </ProtectedRoute>
           }
         />
@@ -76,6 +118,7 @@ function AppRoutes() {
         <Route path="*" element={<NotFound />} />
       </Routes>
       {isResident && <BottomNav />}
+      {showResponderNav && <ResponderNav />}
     </div>
   );
 }

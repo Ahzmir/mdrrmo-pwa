@@ -1,6 +1,5 @@
 import { useNavigate } from "react-router-dom";
 import { AlertTriangle, ChevronRight } from "lucide-react";
-import { SmsFallback } from "@/components/SmsFallback";
 import { useReports } from "@/hooks/useReports";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CategoryIcon } from "@/components/CategoryIcon";
@@ -11,14 +10,14 @@ export default function Home() {
   const recent = reports.slice(0, 3);
 
   return (
-    <div className="flex flex-col gap-6 pb-24 px-4 pt-6 max-w-lg mx-auto">
+    <div className="mx-auto flex max-w-lg flex-col gap-6 bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)] px-4 pt-6 pb-24">
       {/* Header */}
       <div className="text-center">
-        <div className="inline-flex items-center gap-2 bg-emergency-light text-emergency rounded-full px-3 py-1 text-xs font-semibold mb-3">
+        <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-orange-300 bg-orange-100 px-3 py-1 text-xs font-semibold text-orange-600">
           <AlertTriangle size={14} />
           Emergency Response
         </div>
-        <h1 className="text-2xl font-black tracking-tight text-foreground">
+        <h1 className="text-3xl font-black tracking-tight text-orange-600">
           Community Safety
         </h1>
         <p className="text-sm text-muted-foreground mt-1">
@@ -29,25 +28,22 @@ export default function Home() {
       {/* Big CTA */}
       <button
         onClick={() => navigate("/report")}
-        className="emergency-pulse w-full bg-emergency text-emergency-foreground rounded-2xl py-5 px-6 text-lg font-bold shadow-lg active:scale-[0.98] transition-transform flex items-center justify-center gap-3"
+        className="orange-red-pulse mx-auto flex h-52 w-52 flex-col items-center justify-center gap-2 rounded-full border border-orange-200 bg-orange-600 text-center text-lg font-bold text-white shadow-[0_24px_50px_-28px_rgba(234,88,12,0.7)] transition-transform active:scale-[0.98]"
       >
-        <AlertTriangle size={28} />
-        REPORT INCIDENT
+        <AlertTriangle size={34} />
+        <span className="leading-tight">REPORT INCIDENT</span>
       </button>
-
-      {/* SMS Fallback */}
-      <SmsFallback />
 
       {/* Recent Reports */}
       {recent.length > 0 && (
-        <div>
+        <div className="rounded-2xl border border-white/45 bg-white/45 p-4 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-bold text-foreground uppercase tracking-wider">
               Recent Reports
             </h2>
             <button
               onClick={() => navigate("/my-reports")}
-              className="text-xs text-emergency font-medium flex items-center gap-0.5"
+              className="flex items-center gap-0.5 text-xs font-medium text-orange-600"
             >
               View All <ChevronRight size={14} />
             </button>
@@ -56,7 +52,7 @@ export default function Home() {
             {recent.map((r) => (
               <div
                 key={r.id}
-                className="bg-card rounded-xl p-3 border flex items-center gap-3"
+                className="flex items-center gap-3 rounded-xl border border-white/50 bg-white/65 p-3 backdrop-blur-md"
               >
                 {r.photoUrl ? (
                   <img

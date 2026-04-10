@@ -7,7 +7,14 @@ import {
   signOut,
   updateProfile,
 } from "firebase/auth";
-import { doc, getDoc, onSnapshot, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
+import {
+  doc,
+  getDoc,
+  onSnapshot,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
 
 export type UserRole = "resident" | "responder";
@@ -51,7 +58,7 @@ interface ResponderProfileDoc {
 interface AuthContextType {
   user: AuthUser | null;
   loading: boolean;
-  login: (email: string, password: string, role: UserRole) => Promise<void>;
+  login: (email: string, password: string) => Promise<AuthUser>;
   registerResident: (data: ResidentRegistrationInput) => Promise<void>;
   logout: () => Promise<void>;
   isAuthenticated: boolean;
@@ -498,7 +505,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [user?.id, user?.role]);
 
-  const login = useCallback(async (email: string, password: string, role: UserRole) => {
+  const login = useCallback(async (email: string, password: string) => {
     setLoading(true);
 
     try {
@@ -507,33 +514,55 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new Error("Email and password are required.");
       }
 
-      const credential = await signInWithEmailAndPassword(auth, normalizedEmail, password);
+      const candidatePasswords = [password];
+      const trimmedPassword = password.trim();
+      if (trimmedPassword && trimmedPassword !== password) {
+        candidatePasswords.push(trimmedPassword);
+      }
 
-      if (role === "resident") {
-        const residentProfile = await getResidentProfile(credential.user.uid);
+      let credential: Awaited<ReturnType<typeof signInWithEmailAndPassword>> | null = null;
+      let lastSignInError: unknown = null;
 
-        if (!residentProfile) {
-          await signOut(auth);
-          throw new Error("Resident profile not found. Please contact support.");
+      for (const candidatePassword of candidatePasswords) {
+        try {
+          credential = await signInWithEmailAndPassword(auth, normalizedEmail, candidatePassword);
+          break;
+        } catch (signInError) {
+          lastSignInError = signInError;
         }
+      }
 
-        if (isRejectedResident(residentProfile)) {
-          await forceRejectedResidentSignOut(residentProfile.rejectionReason);
-          throw new Error("Registration rejected. Please sign up again.");
-        }
-
-        setUser(toResidentUser(credential.user.uid, residentProfile, credential.user.email));
-        return;
+      if (!credential) {
+        throw lastSignInError || new Error("Unable to sign in.");
       }
 
       const responderProfile = await getResponderProfile(credential.user.uid);
-      if (!responderProfile || responderProfile.role !== "responder") {
-        await signOut(auth);
-        throw new Error("Responder profile not found. Please contact admin.");
+      if (responderProfile?.role === "responder") {
+        await startResponderSession(credential.user.uid);
+        const responderUser = toResponderUser(
+          credential.user.uid,
+          responderProfile,
+          credential.user.email
+        );
+        setUser(responderUser);
+        return responderUser;
       }
 
-      await startResponderSession(credential.user.uid);
-      setUser(toResponderUser(credential.user.uid, responderProfile, credential.user.email));
+      const residentProfile = await getResidentProfile(credential.user.uid);
+
+      if (!residentProfile) {
+        await signOut(auth);
+        throw new Error("Account profile not found. Please contact support.");
+      }
+
+      if (isRejectedResident(residentProfile)) {
+        await forceRejectedResidentSignOut(residentProfile.rejectionReason);
+        throw new Error("Registration rejected. Please sign up again.");
+      }
+
+      const residentUser = toResidentUser(credential.user.uid, residentProfile, credential.user.email);
+      setUser(residentUser);
+      return residentUser;
     } catch (error) {
       throw new Error(mapAuthError(error));
     } finally {

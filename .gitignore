@@ -11,6 +11,18 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+!.env.example
+
+# Secrets and private keys
+*.pem
+*.key
+*.p8
+*.p12
+serviceAccount*.json
+*firebase-adminsdk*.json
+secrets/
 
 
 # Editor directories and files

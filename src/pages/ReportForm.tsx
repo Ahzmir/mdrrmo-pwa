@@ -17,8 +17,9 @@ import { IncidentCategory } from "@/types/incident";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
 import { db } from "@/lib/firebase";
-import { addDoc, collection, doc, getDoc, serverTimestamp, updateDoc } from "firebase/firestore";
+import { addDoc, collection, doc, getDoc, getDocFromServer, serverTimestamp } from "firebase/firestore";
 import { uploadImageToCloudinary } from "@/lib/cloudinary";
+import { toast } from "sonner";
 
 const categories: { id: IncidentCategory; icon: typeof Flame; label: string; color: string }[] = [
   { id: "fire", icon: Flame, label: "Fire", color: "border-fire text-fire bg-fire/10" },
@@ -76,12 +77,14 @@ export default function ReportForm() {
   const [verificationChecked, setVerificationChecked] = useState(false);
   const [isResidentVerified, setIsResidentVerified] = useState(false);
   const [residentBarangay, setResidentBarangay] = useState<string | null>(null);
+  const [residentPhone, setResidentPhone] = useState<string | null>(null);
   const [verificationMessage, setVerificationMessage] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
   const [offline, setOffline] = useState(!navigator.onLine);
   const [forceOfflineMode, setForceOfflineMode] = useState(false);
   const [smsPreviewOpen, setSmsPreviewOpen] = useState(false);
   const [smsDraft, setSmsDraft] = useState("");
+  const firebaseProjectId = (import.meta.env.VITE_FIREBASE_PROJECT_ID as string | undefined) || "(missing-project-id)";
 
   const effectiveOffline = offline || forceOfflineMode;
 
@@ -162,12 +165,15 @@ export default function ReportForm() {
       }
 
       const verifiedCacheKey = getVerifiedCacheKey(user.id);
-      if (typeof window !== "undefined" && window.localStorage.getItem(verifiedCacheKey) === "1") {
+      const cachedApproved =
+        typeof window !== "undefined" && window.localStorage.getItem(verifiedCacheKey) === "1";
+
+      // Keep UI responsive if we already verified before, but still fetch profile
+      // so report metadata (e.g., phone/barangay) is always populated.
+      if (cachedApproved) {
         if (!mounted) return;
         setIsResidentVerified(true);
-        setVerificationChecked(true);
         setVerificationMessage(null);
-        return;
       }
 
       try {
@@ -184,6 +190,7 @@ export default function ReportForm() {
 
         const residentData = residentSnap.data();
         setResidentBarangay(typeof residentData.barangay === "string" ? residentData.barangay : null);
+        setResidentPhone(typeof residentData.phone === "string" ? residentData.phone : null);
         const approved =
           residentData.verified === true || residentData.verificationStatus === "approved";
 
@@ -198,10 +205,12 @@ export default function ReportForm() {
         );
       } catch {
         if (!mounted) return;
-        setIsResidentVerified(false);
-        setVerificationMessage(
-          "Unable to verify your registration status right now. Please try again in a moment."
-        );
+        if (!cachedApproved) {
+          setIsResidentVerified(false);
+          setVerificationMessage(
+            "Unable to verify your registration status right now. Please try again in a moment."
+          );
+        }
       } finally {
         if (!mounted) return;
         setVerificationChecked(true);
@@ -356,6 +365,22 @@ export default function ReportForm() {
       crime: "Crime Incident",
     };
 
+    let uploadedPhotoUrl: string | null = null;
+    if (photoFile) {
+      setUploadingPhoto(true);
+      try {
+        uploadedPhotoUrl = await uploadImageToCloudinary(photoFile);
+      } catch (error) {
+        const message = (error as Error).message || "Unable to upload photo right now. Please try again.";
+        setSubmitError(message);
+        setUploadingPhoto(false);
+        setIsSubmitting(false);
+        return;
+      } finally {
+        setUploadingPhoto(false);
+      }
+    }
+
     try {
       const incidentRef = await addDoc(collection(db, "incidents"), {
         title: titleByCategory[category],
@@ -368,33 +393,32 @@ export default function ReportForm() {
         barangay: residentBarangay || "Banisilan",
         lat: coordinates.lat,
         lng: coordinates.lng,
-        photoUrl: null,
+        photoUrl: uploadedPhotoUrl,
         residentId: user.id,
         residentName: user.name,
         residentEmail: user.email,
+        residentPhone: residentPhone || "",
         assignedResponders: [],
         reportedAt: serverTimestamp(),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
 
-      if (photoFile) {
-        setUploadingPhoto(true);
-        void uploadImageToCloudinary(photoFile)
-          .then((url) =>
-            updateDoc(incidentRef, {
-              photoUrl: url,
-              updatedAt: serverTimestamp(),
-            })
-          )
-          .catch(() => {
-            // Keep report submitted even if photo upload fails.
-          })
-          .finally(() => {
-            setUploadingPhoto(false);
-          });
+      const createdDoc = await getDocFromServer(incidentRef);
+      if (!createdDoc.exists()) {
+        throw new Error(`Incident write was not visible on server yet. Doc ID: ${incidentRef.id}`);
       }
+
+      toast.success(`Report saved: ${incidentRef.id}`);
+      console.info("[report-submit] incident-created", {
+        projectId: firebaseProjectId,
+        incidentId: incidentRef.id,
+        residentId: user.id,
+      });
     } catch (error) {
+      const code = (error as { code?: string }).code || "unknown";
+      const message = (error as { message?: string }).message || "unknown error";
+
       if ((error as { code?: string }).code === "permission-denied") {
         if (typeof window !== "undefined") {
           window.localStorage.removeItem(getVerifiedCacheKey(user.id));
@@ -403,12 +427,14 @@ export default function ReportForm() {
         setVerificationMessage(
           "Your account is not currently approved for incident reporting."
         );
-        setSubmitError("Reporting is currently locked for your account.");
+        setSubmitError(`Reporting is currently locked for your account. [${firebaseProjectId}] (${code})`);
         setIsSubmitting(false);
         return;
       }
 
-      setSubmitError("Unable to submit incident report right now. Please try again.");
+      setSubmitError(
+        `Unable to submit incident report right now. [${firebaseProjectId}] (${code}) ${message}`
+      );
       setIsSubmitting(false);
       return;
     }
@@ -476,13 +502,13 @@ export default function ReportForm() {
   }
 
   return (
-    <div className="pb-24 px-4 pt-4 max-w-lg mx-auto animate-fade-in">
+    <div className="mx-auto max-w-lg animate-fade-in bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)] px-4 pt-4 pb-24">
       {/* Header */}
-      <div className="flex items-center gap-3 mb-6">
+      <div className="mb-6 flex items-center gap-3 rounded-2xl border border-white/45 bg-white/45 px-3 py-3 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
         <button onClick={() => navigate(-1)} className="p-1 text-muted-foreground">
           <ArrowLeft size={22} />
         </button>
-        <h1 className="text-lg font-bold text-foreground">Report Incident</h1>
+        <h1 className="text-lg font-bold text-orange-600">Report Incident</h1>
       </div>
 
       {/* Category Selection */}
@@ -499,7 +525,7 @@ export default function ReportForm() {
                 key={cat.id}
                 onClick={() => setCategory(cat.id)}
                 className={cn(
-                  "flex items-center gap-2 p-3 rounded-xl border-2 transition-all font-semibold text-sm",
+                  "flex items-center gap-2 rounded-xl border-2 bg-white/60 p-3 text-sm font-semibold backdrop-blur-md transition-all",
                   selected
                     ? cat.color + " border-current"
                     : "border-border text-muted-foreground hover:border-foreground/20"
@@ -520,7 +546,7 @@ export default function ReportForm() {
         </label>
         <div
           className={cn(
-            "bg-secondary rounded-xl px-4 py-3 text-sm border transition-all duration-300",
+            "rounded-xl border bg-white/60 px-4 py-3 text-sm backdrop-blur-md transition-all duration-300",
             location
               ? "border-success/30 shadow-[0_0_0_1px_hsl(var(--success)/0.15)]"
               : "border-transparent",
@@ -550,7 +576,7 @@ export default function ReportForm() {
           <button
             onClick={detectLocation}
             disabled={locating}
-            className="bg-secondary rounded-xl px-4 py-2 flex items-center gap-2 text-sm font-medium text-foreground transition-all duration-200 disabled:opacity-60"
+            className="flex items-center gap-2 rounded-xl border border-white/55 bg-white/60 px-4 py-2 text-sm font-medium text-foreground backdrop-blur-md transition-all duration-200 disabled:opacity-60"
           >
             {locating ? <Loader2 size={18} className="animate-spin" /> : <MapPin size={18} />}
             {locating ? "Updating..." : "Refresh"}
@@ -574,7 +600,7 @@ export default function ReportForm() {
           onChange={(e) => setDescription(e.target.value)}
           rows={3}
           placeholder="Briefly describe the emergency..."
-          className="w-full bg-secondary rounded-xl px-4 py-3 text-sm placeholder:text-muted-foreground border-0 outline-none resize-none focus:ring-2 focus:ring-emergency/30"
+          className="w-full resize-none rounded-xl border border-white/55 bg-white/60 px-4 py-3 text-sm placeholder:text-muted-foreground outline-none backdrop-blur-md focus:ring-2 focus:ring-warning/35"
         />
       </div>
 
@@ -585,7 +611,7 @@ export default function ReportForm() {
         </label>
         <input ref={fileRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhoto} />
         {photoPreview ? (
-          <div className="relative rounded-xl overflow-hidden">
+          <div className="relative overflow-hidden rounded-xl border border-white/55 bg-white/60 backdrop-blur-md">
             <img src={photoPreview} alt="Incident" className="w-full h-40 object-cover" />
             <button
               onClick={() => {
@@ -601,7 +627,7 @@ export default function ReportForm() {
         ) : (
           <button
             onClick={() => fileRef.current?.click()}
-            className="w-full border-2 border-dashed border-border rounded-xl py-6 flex flex-col items-center gap-2 text-muted-foreground hover:border-foreground/20 transition-colors"
+            className="flex w-full flex-col items-center gap-2 rounded-xl border-2 border-dashed border-white/55 bg-white/50 py-6 text-muted-foreground backdrop-blur-md transition-colors hover:border-orange-300"
           >
             <Camera size={24} />
             <span className="text-xs font-medium">Tap to take or upload photo</span>
@@ -610,7 +636,7 @@ export default function ReportForm() {
       </div>
 
       {/* Submit */}
-      <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-border bg-secondary/40 px-3 py-2">
+      <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-white/55 bg-white/50 px-3 py-2 backdrop-blur-md">
         <p className="text-xs text-muted-foreground">
           Manual test toggle for SMS fallback mode.
         </p>
@@ -656,7 +682,7 @@ export default function ReportForm() {
             isResidentVerified &&
             !uploadingPhoto &&
             !isSubmitting
-            ? "bg-emergency text-emergency-foreground shadow-lg active:scale-[0.98]"
+            ? "bg-orange-600 text-white shadow-lg active:scale-[0.98]"
             : "bg-muted text-muted-foreground cursor-not-allowed"
         )}
       >
@@ -678,7 +704,7 @@ export default function ReportForm() {
 
       {smsPreviewOpen && (
         <div className="fixed inset-0 z-[120] bg-foreground/40 backdrop-blur-sm px-4 py-6">
-          <div className="mx-auto max-w-lg rounded-2xl border bg-card p-4 shadow-2xl">
+          <div className="mx-auto max-w-lg rounded-2xl border border-white/55 bg-white/90 p-4 shadow-2xl backdrop-blur-xl">
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <MessageSquare size={18} className="text-warning" />
@@ -686,7 +712,7 @@ export default function ReportForm() {
               </div>
               <button
                 onClick={() => setSmsPreviewOpen(false)}
-                className="rounded-md p-1 text-muted-foreground hover:bg-secondary"
+                className="rounded-md p-1 text-muted-foreground hover:bg-white/70"
               >
                 <X size={16} />
               </button>
@@ -700,7 +726,7 @@ export default function ReportForm() {
               value={smsDraft}
               onChange={(event) => setSmsDraft(event.target.value)}
               rows={10}
-              className="w-full rounded-xl border bg-background px-3 py-2 text-xs font-mono text-foreground outline-none focus:ring-2 focus:ring-warning/30"
+              className="w-full rounded-xl border border-white/60 bg-white/70 px-3 py-2 text-xs font-mono text-foreground outline-none focus:ring-2 focus:ring-warning/35"
             />
 
             <div className="mt-3 flex gap-2">
@@ -715,7 +741,7 @@ export default function ReportForm() {
                   setSmsPreviewOpen(false);
                   launchSmsFallback(smsDraft);
                 }}
-                className="flex-1 rounded-xl bg-warning py-2 text-sm font-semibold text-warning-foreground"
+                className="flex-1 rounded-xl bg-orange-600 py-2 text-sm font-semibold text-white"
               >
                 Open SMS App
               </button>

@@ -458,9 +458,15 @@ export async function updateIncidentStatus(id: string, status: ReportStatus) {
     };
 
     if (status === "resolved") {
-      // Clear remaining assignees on completion to avoid stale legacy IDs.
-      incidentUpdate.assignedResponders = [];
-      incidentUpdate.assignedResponderEmails = [];
+      // Keep resolver linkage so responder queries continue to include resolved incidents.
+      if (responderUid) {
+        incidentUpdate.assignedResponders = arrayUnion(responderUid);
+        incidentUpdate.responderHistoryIds = arrayUnion(responderUid);
+      }
+      if (responderEmail) {
+        incidentUpdate.assignedResponderEmails = arrayUnion(responderEmail);
+        incidentUpdate.responderHistoryEmails = arrayUnion(responderEmail);
+      }
     } else if (responderUid) {
       incidentUpdate.assignedResponders = arrayRemove(responderUid);
       if (responderEmail) {
@@ -579,6 +585,77 @@ export async function updateIncidentStatus(id: string, status: ReportStatus) {
   } catch (error) {
     const code = (error as { code?: string }).code || "unknown";
     logIncidentAction("status-toggle:failed", { incidentId: id, nextStatus: status, code, message: (error as Error).message }, true);
+    throw error;
+  }
+}
+
+export async function markIncidentOnScene(id: string) {
+  const incidentRef = doc(db, "incidents", id);
+  logIncidentAction("mark-on-scene:start", { incidentId: id });
+
+  try {
+    const incidentSnap = await withTimeout(
+      getDocFromServer(incidentRef),
+      12000,
+      "mark on-scene pre-read"
+    );
+
+    if (!incidentSnap.exists()) {
+      throw new Error("Incident not found.");
+    }
+
+    const currentStatus = incidentSnap.data()?.status;
+    if (currentStatus !== "en_route") {
+      logIncidentAction("mark-on-scene:skip", {
+        incidentId: id,
+        currentStatus,
+      });
+      return false;
+    }
+
+    const updatePayload = {
+      status: "on_scene",
+      updatedAt: serverTimestamp(),
+    };
+
+    try {
+      await withTimeout(updateDoc(incidentRef, updatePayload), 12000, "mark on-scene write");
+    } catch (writeError) {
+      if (!isTimeoutError(writeError)) {
+        throw writeError;
+      }
+
+      await withTimeout(
+        patchFirestoreDocumentViaRest(
+          "incidents",
+          id,
+          {
+            status: "on_scene",
+            updatedAt: new Date(),
+          },
+          ["status", "updatedAt"]
+        ),
+        12000,
+        "mark on-scene REST fallback"
+      );
+    }
+
+    logIncidentAction("mark-on-scene:ok", {
+      incidentId: id,
+      nextStatus: "on_scene",
+    });
+    return true;
+  } catch (error) {
+    const code = (error as { code?: string }).code || "unknown";
+    logIncidentAction(
+      "mark-on-scene:failed",
+      {
+        incidentId: id,
+        code,
+        message: (error as Error).message,
+      },
+      true
+    );
     throw error;
   }
 }

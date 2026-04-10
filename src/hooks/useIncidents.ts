@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Timestamp, collection, doc, onSnapshot, query, where } from "firebase/firestore";
 import { db } from "@/lib/firebase";
+import { auth } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { IncidentReport, IncidentCategory, ReportStatus } from "@/types/incident";
 
@@ -189,11 +190,177 @@ export function useIncidents() {
       unsubscribeList.push(unsubscribe);
     };
 
+    const subscribeByResponderResponseAccepted = (responderId: string) => {
+      if (!responderId) {
+        return;
+      }
+
+      pushIncidentDebugLog(`Subscribing by responderResponses.${responderId}.status == accepted.`);
+      const incidentsRef = collection(db, "incidents");
+      const acceptedQuery = query(
+        incidentsRef,
+        where(`responderResponses.${responderId}.status`, "==", "accepted")
+      );
+
+      const unsubscribe = onSnapshot(
+        acceptedQuery,
+        (snapshot) => {
+          const incidentMap = new Map<string, IncidentReport>();
+
+          snapshot.docs.forEach((incidentDoc) => {
+            const data = incidentDoc.data() as Record<string, unknown>;
+            incidentMap.set(incidentDoc.id, toIncidentReport(incidentDoc.id, data));
+          });
+
+          pushIncidentDebugLog(
+            `Accepted-response query id=${responderId} docs=${snapshot.docs.length} ids=${snapshot.docs
+              .map((docItem) => docItem.id)
+              .join(",") || "none"}.`
+          );
+
+          snapshotsByKey.set(`accepted-response:${responderId}`, incidentMap);
+          emitMergedRows();
+        },
+        (error) => {
+          const code = (error as { code?: string }).code || "unknown";
+          pushIncidentDebugLog(
+            `Accepted-response query failed id=${responderId} code=${code} msg=${error.message}`,
+            true
+          );
+          snapshotsByKey.set(`accepted-response:${responderId}`, new Map());
+          emitMergedRows();
+        }
+      );
+
+      unsubscribeList.push(unsubscribe);
+    };
+
+    const subscribeResolvedByStatusFallback = (responderIds: string[], normalizedEmail: string) => {
+      pushIncidentDebugLog("Subscribing to resolved-status fallback query.");
+      const incidentsRef = collection(db, "incidents");
+      const resolvedQuery = query(incidentsRef, where("status", "==", "resolved"));
+
+      const responderIdSet = new Set(responderIds.filter(Boolean));
+      const responderEmail = normalizedEmail.trim().toLowerCase();
+
+      const unsubscribe = onSnapshot(
+        resolvedQuery,
+        (snapshot) => {
+          const incidentMap = new Map<string, IncidentReport>();
+
+          snapshot.docs.forEach((incidentDoc) => {
+            const data = incidentDoc.data() as Record<string, unknown>;
+
+            const assignedResponders = Array.isArray(data.assignedResponders)
+              ? (data.assignedResponders as unknown[]).filter((value): value is string => typeof value === "string")
+              : [];
+            const assignedResponderEmails = Array.isArray(data.assignedResponderEmails)
+              ? (data.assignedResponderEmails as unknown[])
+                  .filter((value): value is string => typeof value === "string")
+                  .map((value) => value.trim().toLowerCase())
+              : [];
+            const historyIds = Array.isArray(data.responderHistoryIds)
+              ? (data.responderHistoryIds as unknown[]).filter((value): value is string => typeof value === "string")
+              : [];
+            const historyEmails = Array.isArray(data.responderHistoryEmails)
+              ? (data.responderHistoryEmails as unknown[])
+                  .filter((value): value is string => typeof value === "string")
+                  .map((value) => value.trim().toLowerCase())
+              : [];
+
+            const responses =
+              data.responderResponses && typeof data.responderResponses === "object" && !Array.isArray(data.responderResponses)
+                ? (data.responderResponses as Record<string, unknown>)
+                : {};
+
+            const linkedById =
+              assignedResponders.some((id) => responderIdSet.has(id)) ||
+              historyIds.some((id) => responderIdSet.has(id)) ||
+              Object.keys(responses).some((id) => responderIdSet.has(id));
+
+            const linkedByEmail =
+              !!responderEmail &&
+              (assignedResponderEmails.includes(responderEmail) || historyEmails.includes(responderEmail));
+
+            if (!linkedById && !linkedByEmail) {
+              return;
+            }
+
+            incidentMap.set(incidentDoc.id, toIncidentReport(incidentDoc.id, data));
+          });
+
+          pushIncidentDebugLog(
+            `Resolved fallback query docs=${snapshot.docs.length} kept=${incidentMap.size}.`
+          );
+
+          snapshotsByKey.set("resolved-fallback", incidentMap);
+          emitMergedRows();
+        },
+        (error) => {
+          const code = (error as { code?: string }).code || "unknown";
+          pushIncidentDebugLog(
+            `Resolved fallback query failed code=${code} msg=${error.message}`,
+            true
+          );
+          snapshotsByKey.set("resolved-fallback", new Map());
+          emitMergedRows();
+        }
+      );
+
+      unsubscribeList.push(unsubscribe);
+    };
+
+    const subscribeResolvedHistoryByResponderId = (historyResponderId: string) => {
+      pushIncidentDebugLog(`Subscribing by responderHistoryIds contains uid=${historyResponderId}.`);
+      const incidentsRef = collection(db, "incidents");
+      const historyQuery = query(incidentsRef, where("responderHistoryIds", "array-contains", historyResponderId));
+
+      const unsubscribe = onSnapshot(
+        historyQuery,
+        (snapshot) => {
+          const incidentMap = new Map<string, IncidentReport>();
+
+          snapshot.docs.forEach((incidentDoc) => {
+            const data = incidentDoc.data() as Record<string, unknown>;
+            incidentMap.set(incidentDoc.id, toIncidentReport(incidentDoc.id, data));
+          });
+
+          pushIncidentDebugLog(
+            `History UID query uid=${historyResponderId} docs=${snapshot.docs.length} ids=${snapshot.docs
+              .map((docItem) => docItem.id)
+              .join(",") || "none"}.`
+          );
+
+          snapshotsByKey.set(`history-uid:${historyResponderId}`, incidentMap);
+          emitMergedRows();
+        },
+        (error) => {
+          const code = (error as { code?: string }).code || "unknown";
+          pushIncidentDebugLog(
+            `History UID query failed uid=${historyResponderId} code=${code} msg=${error.message}`,
+            true
+          );
+          snapshotsByKey.set(`history-uid:${historyResponderId}`, new Map());
+          emitMergedRows();
+        }
+      );
+
+      unsubscribeList.push(unsubscribe);
+    };
+
     const initialize = async () => {
       const normalizedEmail = responderEmail.trim().toLowerCase();
 
       // Always subscribe to auth UID immediately so incident feed cannot stall.
       subscribeByResponderId(responderUid);
+      subscribeResolvedHistoryByResponderId(responderUid);
+
+      const authUid = auth.currentUser?.uid || "";
+      const responderIdCandidates = Array.from(new Set([responderUid, authUid].filter(Boolean)));
+      responderIdCandidates.forEach((candidateId) => {
+        subscribeByResponderResponseAccepted(candidateId);
+      });
+      subscribeResolvedByStatusFallback(responderIdCandidates, normalizedEmail);
 
       // Fallback path: include incident referenced by responder currentIncidentId.
       const responderRef = doc(db, "responders", responderUid);
@@ -317,6 +484,40 @@ export function useIncidents() {
         );
 
         unsubscribeList.push(unsubscribeEmail);
+
+        pushIncidentDebugLog(`Subscribing by responderHistoryEmails contains email=${normalizedEmail}.`);
+        const historyEmailQuery = query(incidentsRef, where("responderHistoryEmails", "array-contains", normalizedEmail));
+        const unsubscribeHistoryEmail = onSnapshot(
+          historyEmailQuery,
+          (snapshot) => {
+            const incidentMap = new Map<string, IncidentReport>();
+
+            snapshot.docs.forEach((incidentDoc) => {
+              const data = incidentDoc.data() as Record<string, unknown>;
+              incidentMap.set(incidentDoc.id, toIncidentReport(incidentDoc.id, data));
+            });
+
+            pushIncidentDebugLog(
+              `History email query email=${normalizedEmail} docs=${snapshot.docs.length} ids=${snapshot.docs
+                .map((docItem) => docItem.id)
+                .join(",") || "none"}.`
+            );
+
+            snapshotsByKey.set(`history-email:${normalizedEmail}`, incidentMap);
+            emitMergedRows();
+          },
+          (error) => {
+            const code = (error as { code?: string }).code || "unknown";
+            pushIncidentDebugLog(
+              `History email query failed email=${normalizedEmail} code=${code} msg=${error.message}`,
+              true
+            );
+            snapshotsByKey.set(`history-email:${normalizedEmail}`, new Map());
+            emitMergedRows();
+          }
+        );
+
+        unsubscribeList.push(unsubscribeHistoryEmail);
       }
     };
 

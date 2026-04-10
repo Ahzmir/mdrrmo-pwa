@@ -4,15 +4,12 @@ import {
   RESIDENT_REJECTED_KEY,
   RESIDENT_REJECTION_REASON_KEY,
   useAuth,
-  UserRole,
 } from "@/contexts/AuthContext";
-import { ShieldCheck, Users, Loader2, AlertTriangle } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { Loader2, AlertTriangle } from "lucide-react";
 
 export default function Login() {
   const { login, loading, isAuthenticated, user } = useAuth();
   const navigate = useNavigate();
-  const [role, setRole] = useState<UserRole>("resident");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -23,7 +20,6 @@ export default function Login() {
     if (!rejected) return;
     const rejectionReason = window.sessionStorage.getItem(RESIDENT_REJECTION_REASON_KEY);
 
-    setRole("resident");
     window.sessionStorage.removeItem(RESIDENT_REJECTED_KEY);
     if (rejectionReason?.trim()) {
       setError("Your registration was rejected by admin. Please review the reason and sign up again.");
@@ -42,104 +38,70 @@ export default function Login() {
     setError(null);
 
     try {
-      await login(email, password, role);
-      navigate(role === "resident" ? "/" : "/responder", { replace: true });
+      const authUser = await login(email, password);
+      navigate(authUser.role === "resident" ? "/" : "/responder", { replace: true });
     } catch (err) {
       setError((err as Error).message || "Unable to sign in.");
     }
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center px-6 bg-background animate-fade-in">
-      <div className="w-full max-w-sm space-y-6">
+    <div className="min-h-screen flex flex-col items-center justify-center px-6 animate-fade-in bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)]">
+      <div className="w-full max-w-sm space-y-5">
         {/* Logo / Header */}
-        <div className="text-center space-y-2">
-          <div className="inline-flex items-center gap-2 bg-emergency-light text-emergency rounded-full px-3 py-1 text-xs font-semibold">
+        <div className="rounded-2xl border border-white/45 bg-white/45 p-5 text-center space-y-2 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
+          <div className="inline-flex items-center gap-2 rounded-full border border-orange-300 bg-orange-100 px-3 py-1 text-xs font-semibold text-orange-600">
             <AlertTriangle size={14} />
             Emergency Response
           </div>
-          <h1 className="text-2xl font-black text-foreground">Sign In</h1>
+          <h1 className="text-4xl font-black leading-tight text-orange-600">Sign In</h1>
           <p className="text-sm text-muted-foreground">Access the emergency response system</p>
         </div>
 
-        {/* Role Toggle */}
-        <div className="relative bg-secondary rounded-2xl p-1 animate-slide-up">
-          <div
-            className={cn(
-              "absolute top-1 left-1 h-[calc(100%-0.5rem)] w-[calc(50%-0.5rem)] rounded-xl bg-card transition-all duration-300 ease-out",
-              role === "responder" ? "translate-x-[100%]" : "translate-x-0"
-            )}
-          />
-          <div className="relative flex gap-1">
-            {([
-              { id: "resident" as UserRole, icon: Users, label: "Resident" },
-              { id: "responder" as UserRole, icon: ShieldCheck, label: "Responder" },
-            ]).map((r) => {
-              const Icon = r.icon;
-              const active = role === r.id;
-              return (
-                <button
-                  key={r.id}
-                  type="button"
-                  onClick={() => setRole(r.id)}
-                  aria-pressed={active}
-                  className={cn(
-                    "flex-1 relative z-10 flex items-center justify-center gap-2 py-3 rounded-xl text-sm font-semibold toggle-fade",
-                    active
-                      ? "text-foreground"
-                      : "text-muted-foreground"
-                  )}
-                >
-                  <Icon size={18} />
-                  {r.label}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
         {/* Form */}
-        <form onSubmit={handleSubmit} className="space-y-3 animate-slide-up">
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="Email address"
-            className="w-full bg-secondary rounded-xl px-4 py-3.5 text-sm placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-emergency/30"
-          />
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Password"
-            className="w-full bg-secondary rounded-xl px-4 py-3.5 text-sm placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-emergency/30"
-          />
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full bg-emergency text-emergency-foreground rounded-2xl py-4 font-bold text-base flex items-center justify-center gap-2 active:scale-[0.98] transition-transform"
-          >
-            {loading ? (
-              <Loader2 size={20} className="animate-spin" />
-            ) : (
-              <>Sign In as {role === "resident" ? "Resident" : "Responder"}</>
-            )}
-          </button>
-          {error && <p className="text-sm text-destructive text-center">{error}</p>}
-        </form>
+        <div className="rounded-2xl border border-white/45 bg-white/45 p-5 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
+          <form onSubmit={handleSubmit} className="space-y-3 animate-slide-up">
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="Email address"
+              className="w-full rounded-xl border border-white/55 bg-white/55 px-4 py-3.5 text-sm placeholder:text-muted-foreground outline-none backdrop-blur-md focus:ring-2 focus:ring-warning/35"
+            />
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Password"
+              className="w-full rounded-xl border border-white/55 bg-white/55 px-4 py-3.5 text-sm placeholder:text-muted-foreground outline-none backdrop-blur-md focus:ring-2 focus:ring-warning/35"
+            />
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full rounded-2xl bg-orange-600 py-4 text-base font-bold text-white flex items-center justify-center gap-2 active:scale-[0.98] transition-transform disabled:opacity-70"
+            >
+              {loading ? (
+                <Loader2 size={20} className="animate-spin" />
+              ) : (
+                <>Sign In</>
+              )}
+            </button>
+            {error && <p className="text-sm text-destructive text-center">{error}</p>}
+            <Link
+              to="/forgot-password"
+              className="block w-full text-center text-xs text-orange-600 hover:text-orange-700 transition-colors"
+            >
+              Forgot password?
+            </Link>
+          </form>
 
-        {role === "resident" ? (
-          <p className="text-xs text-center text-muted-foreground">
+          <p className="mt-5 text-xs text-center text-muted-foreground">
             New resident?{" "}
-            <Link to="/signup-resident" className="text-emergency font-semibold">
+            <Link to="/signup-resident" className="text-orange-600 font-semibold">
               Create verified account
             </Link>
           </p>
-        ) : (
-          <p className="text-[11px] text-center text-muted-foreground">
-            Use responder credentials created by admin.
-          </p>
-        )}
+        </div>
       </div>
     </div>
   );
