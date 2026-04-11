@@ -9,26 +9,16 @@ import {
   Route,
   TriangleAlert,
 } from "lucide-react";
-import L from "leaflet";
-import { MapContainer, Marker, Polyline, Popup, TileLayer, useMap } from "react-leaflet";
-import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
-import markerIcon from "leaflet/dist/images/marker-icon.png";
-import markerShadow from "leaflet/dist/images/marker-shadow.png";
-import "leaflet/dist/leaflet.css";
 import { useIncidents } from "@/hooks/useIncidents";
 import { acceptIncident, markIncidentOnScene, rejectIncident, updateIncidentStatus } from "@/stores/incidentStore";
 import { CategoryIcon } from "@/components/CategoryIcon";
 import { StatusBadge } from "@/components/StatusBadge";
 import { toast } from "sonner";
+import { loadGoogleMapsApi } from "@/lib/googleMaps";
 
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: markerIcon2x,
-  iconUrl: markerIcon,
-  shadowUrl: markerShadow,
-});
-
-const GEOAPIFY_API_KEY = import.meta.env.VITE_GEOAPIFY_API_KEY;
+const GOOGLE_MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
 const ARRIVAL_RADIUS_METERS = 120;
+const OFF_ROUTE_REROUTE_METERS = 70;
 
 type LatLng = [number, number];
 type RouteInstruction = {
@@ -44,18 +34,10 @@ type RouteOption = {
   distance: number | null;
   duration: number | null;
   instructions: RouteInstruction[];
-  source: "geoapify" | "fallback";
+  source: "google" | "fallback";
 };
 
-const responderMarkerIcon = L.icon({
-  iconRetinaUrl: markerIcon2x,
-  iconUrl: markerIcon,
-  shadowUrl: markerShadow,
-  iconSize: [25, 41],
-  iconAnchor: [12, 41],
-  popupAnchor: [1, -34],
-  shadowSize: [41, 41],
-});
+const ROUTE_OPTIMIZATION_REFRESH_MS = 90000;
 
 function formatDistance(meters: number) {
   return meters >= 1000
@@ -108,57 +90,413 @@ function normalizeInstructionText(value: unknown) {
   return text.length ? text : null;
 }
 
-function RouteViewport({
-  points,
-  followPoint,
+function stripHtml(value: string) {
+  return value.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function toGoogleLatLng(point: LatLng): google.maps.LatLngLiteral {
+  return { lat: point[0], lng: point[1] };
+}
+
+function buildBounds(points: LatLng[]) {
+  const bounds = new google.maps.LatLngBounds();
+  points.forEach((point) => {
+    bounds.extend({ lat: point[0], lng: point[1] });
+  });
+  return bounds;
+}
+
+function getBearingDegrees(from: LatLng, to: LatLng) {
+  const lat1 = (from[0] * Math.PI) / 180;
+  const lat2 = (to[0] * Math.PI) / 180;
+  const dLng = ((to[1] - from[1]) * Math.PI) / 180;
+
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x =
+    Math.cos(lat1) * Math.sin(lat2) -
+    Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  const theta = Math.atan2(y, x);
+  return (theta * 180) / Math.PI + 360;
+}
+
+function normalizeHeading(heading: number) {
+  return ((heading % 360) + 360) % 360;
+}
+
+function smoothHeading(previous: number, next: number) {
+  const prev = normalizeHeading(previous);
+  const target = normalizeHeading(next);
+  let delta = target - prev;
+
+  if (delta > 180) delta -= 360;
+  if (delta < -180) delta += 360;
+
+  return normalizeHeading(prev + delta * 0.35);
+}
+
+function distanceToSegmentMeters(point: LatLng, start: LatLng, end: LatLng) {
+  const latScale = 111320;
+  const midLatRad = ((start[0] + end[0]) / 2) * (Math.PI / 180);
+  const lngScale = 111320 * Math.cos(midLatRad);
+
+  const px = point[1] * lngScale;
+  const py = point[0] * latScale;
+  const sx = start[1] * lngScale;
+  const sy = start[0] * latScale;
+  const ex = end[1] * lngScale;
+  const ey = end[0] * latScale;
+
+  const dx = ex - sx;
+  const dy = ey - sy;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared === 0) {
+    return Math.sqrt((px - sx) * (px - sx) + (py - sy) * (py - sy));
+  }
+
+  const t = Math.max(0, Math.min(1, ((px - sx) * dx + (py - sy) * dy) / lengthSquared));
+  const cx = sx + t * dx;
+  const cy = sy + t * dy;
+
+  return Math.sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+}
+
+function distanceToPolylineMeters(point: LatLng, polyline: LatLng[]) {
+  if (polyline.length === 0) return Number.POSITIVE_INFINITY;
+  if (polyline.length === 1) return haversineMeters(point, polyline[0]);
+
+  let minDistance = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < polyline.length - 1; i += 1) {
+    const distance = distanceToSegmentMeters(point, polyline[i], polyline[i + 1]);
+    if (distance < minDistance) {
+      minDistance = distance;
+    }
+  }
+
+  return minDistance;
+}
+
+function ResponderIncidentGoogleMap({
+  mapCenter,
+  currentPosition,
+  destination,
+  routeOptions,
+  selectedRouteId,
+  fastestRouteId,
+  showRouteDetails,
+  className,
+  zoom,
 }: {
-  points: LatLng[];
-  followPoint?: LatLng | null;
+  mapCenter: LatLng;
+  currentPosition: LatLng | null;
+  destination: LatLng;
+  routeOptions: RouteOption[];
+  selectedRouteId: string | null;
+  fastestRouteId: string | null;
+  showRouteDetails: boolean;
+  className: string;
+  zoom: number;
 }) {
-  const map = useMap();
+  const mapElementRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<google.maps.Map | null>(null);
+  const responderMarkerRef = useRef<google.maps.Marker | null>(null);
+  const destinationMarkerRef = useRef<google.maps.Marker | null>(null);
+  const routePolylineByIdRef = useRef<Map<string, google.maps.Polyline>>(new Map());
+  const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null);
   const hasIntroAnimatedRef = useRef(false);
   const lastFollowAnimationAtRef = useRef(0);
+  const lastResponderPointRef = useRef<LatLng | null>(null);
+  const lastHeadingRef = useRef<number>(0);
 
   useEffect(() => {
-    if (points.length < 2) {
+    let cancelled = false;
+    if (!mapElementRef.current || mapRef.current) {
       return;
     }
 
-    const bounds = L.latLngBounds(points);
-    if (!hasIntroAnimatedRef.current) {
-      // Initial cinematic fly-in to show both responder and destination.
-      map.flyToBounds(bounds.pad(0.18), {
-        duration: 1.2,
-        easeLinearity: 0.25,
-        maxZoom: 16,
+    void loadGoogleMapsApi()
+      .then(() => {
+        if (cancelled || !mapElementRef.current) {
+          return;
+        }
+
+        const map = new google.maps.Map(mapElementRef.current, {
+          center: toGoogleLatLng(mapCenter),
+          zoom,
+          mapTypeControl: false,
+          streetViewControl: false,
+          fullscreenControl: false,
+          rotateControl: true,
+          tilt: 0,
+          clickableIcons: false,
+          gestureHandling: "greedy",
+          mapId: import.meta.env.VITE_GOOGLE_MAP_ID || undefined,
+        });
+
+        mapRef.current = map;
+        sharedInfoWindowRef.current = new google.maps.InfoWindow();
+      })
+      .catch(() => {
+        // Parent handles user-visible key/config errors.
       });
+
+    return () => {
+      cancelled = true;
+      responderMarkerRef.current?.setMap(null);
+      destinationMarkerRef.current?.setMap(null);
+      routePolylineByIdRef.current.forEach((polyline) => polyline.setMap(null));
+      routePolylineByIdRef.current.clear();
+      sharedInfoWindowRef.current?.close();
+      sharedInfoWindowRef.current = null;
+      mapRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      google.maps.event.trigger(map, "resize");
+    });
+
+    if (mapElementRef.current) {
+      resizeObserver.observe(mapElementRef.current);
+    }
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    map.setZoom(zoom);
+    map.panTo(toGoogleLatLng(mapCenter));
+  }, [mapCenter, zoom]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    if (showRouteDetails) {
+      map.setTilt(45);
+      return;
+    }
+
+    map.setTilt(0);
+    map.setHeading(0);
+  }, [showRouteDetails]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    if (!destinationMarkerRef.current) {
+      destinationMarkerRef.current = new google.maps.Marker({
+        map,
+        position: toGoogleLatLng(destination),
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          fillColor: "#dc2626",
+          fillOpacity: 1,
+          strokeColor: "#ffffff",
+          strokeWeight: 2,
+          scale: 8,
+        },
+        label: {
+          text: "I",
+          color: "#ffffff",
+          fontSize: "10px",
+          fontWeight: "700",
+        },
+      });
+
+      destinationMarkerRef.current.addListener("click", () => {
+        if (!sharedInfoWindowRef.current || !destinationMarkerRef.current) return;
+        sharedInfoWindowRef.current.setContent("<div style='font-size:12px;font-weight:600'>Incident scene</div>");
+        sharedInfoWindowRef.current.open({ map, anchor: destinationMarkerRef.current });
+      });
+    }
+
+    destinationMarkerRef.current.setPosition(toGoogleLatLng(destination));
+  }, [destination]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    if (!currentPosition) {
+      responderMarkerRef.current?.setMap(null);
+      responderMarkerRef.current = null;
+      return;
+    }
+
+    if (!responderMarkerRef.current) {
+      responderMarkerRef.current = new google.maps.Marker({
+        map,
+        position: toGoogleLatLng(currentPosition),
+        icon: {
+          path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+          fillColor: "#2563eb",
+          fillOpacity: 1,
+          strokeColor: "#ffffff",
+          strokeWeight: 2,
+          scale: 6,
+          rotation: lastHeadingRef.current,
+        },
+        zIndex: 180,
+      });
+
+      responderMarkerRef.current.addListener("click", () => {
+        if (!sharedInfoWindowRef.current || !responderMarkerRef.current) return;
+        sharedInfoWindowRef.current.setContent("<div style='font-size:12px;font-weight:600'>Your current location</div>");
+        sharedInfoWindowRef.current.open({ map, anchor: responderMarkerRef.current });
+      });
+    }
+
+    const previousPoint = lastResponderPointRef.current;
+    if (previousPoint) {
+      const rawHeading = getBearingDegrees(previousPoint, currentPosition);
+      const nextHeading = smoothHeading(lastHeadingRef.current, rawHeading);
+      lastHeadingRef.current = nextHeading;
+      responderMarkerRef.current.setIcon({
+        path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+        fillColor: "#2563eb",
+        fillOpacity: 1,
+        strokeColor: "#ffffff",
+        strokeWeight: 2,
+        scale: 6,
+        rotation: nextHeading,
+      });
+
+      if (showRouteDetails) {
+        map.setHeading(nextHeading);
+      }
+    }
+
+    responderMarkerRef.current.setPosition(toGoogleLatLng(currentPosition));
+    lastResponderPointRef.current = currentPosition;
+  }, [currentPosition, showRouteDetails]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const activeRouteIds = new Set<string>();
+
+    if (showRouteDetails && routeOptions.length > 0) {
+      routeOptions.forEach((route) => {
+        activeRouteIds.add(route.id);
+
+        const isSelected = selectedRouteId ? selectedRouteId === route.id : routeOptions[0]?.id === route.id;
+        const isFastest = fastestRouteId === route.id;
+        const strokeColor = isSelected ? "#f97316" : isFastest ? "#fb923c" : "#9ca3af";
+        const strokeWeight = isSelected ? 6 : 4;
+        const strokeOpacity = isSelected ? 0.95 : isFastest ? 0.65 : 0.4;
+
+        const existingPolyline = routePolylineByIdRef.current.get(route.id);
+        if (!existingPolyline) {
+          const polyline = new google.maps.Polyline({
+            map,
+            path: route.points.map(toGoogleLatLng),
+            strokeColor,
+            strokeOpacity,
+            strokeWeight,
+            icons: isSelected
+              ? undefined
+              : [{
+                  icon: {
+                    path: "M 0,-1 0,1",
+                    strokeOpacity: 1,
+                    scale: 2,
+                  },
+                  offset: "0",
+                  repeat: "12px",
+                }],
+            zIndex: isSelected ? 120 : isFastest ? 100 : 80,
+          });
+
+          routePolylineByIdRef.current.set(route.id, polyline);
+          return;
+        }
+
+        existingPolyline.setOptions({
+          path: route.points.map(toGoogleLatLng),
+          strokeColor,
+          strokeOpacity,
+          strokeWeight,
+          icons: isSelected
+            ? undefined
+            : [{
+                icon: {
+                  path: "M 0,-1 0,1",
+                  strokeOpacity: 1,
+                  scale: 2,
+                },
+                offset: "0",
+                repeat: "12px",
+              }],
+          zIndex: isSelected ? 120 : isFastest ? 100 : 80,
+        });
+      });
+    }
+
+    routePolylineByIdRef.current.forEach((polyline, id) => {
+      if (activeRouteIds.has(id)) {
+        return;
+      }
+
+      polyline.setMap(null);
+      routePolylineByIdRef.current.delete(id);
+    });
+  }, [fastestRouteId, routeOptions, selectedRouteId, showRouteDetails]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !showRouteDetails || !currentPosition) {
+      return;
+    }
+
+    const selectedRoute = routeOptions.find((option) => option.id === selectedRouteId) || routeOptions[0];
+    if (!selectedRoute || selectedRoute.points.length < 2) {
+      return;
+    }
+
+    const bounds = buildBounds(selectedRoute.points);
+
+    if (!hasIntroAnimatedRef.current) {
+      map.fitBounds(bounds, 72);
       hasIntroAnimatedRef.current = true;
       return;
     }
 
-    map.fitBounds(bounds.pad(0.15), { animate: true, duration: 0.65, maxZoom: 16 });
-  }, [map, points]);
-
-  useEffect(() => {
-    if (!followPoint || !hasIntroAnimatedRef.current) {
-      return;
-    }
-
     const now = Date.now();
-    // Throttle follow-camera animation so live GPS updates don't feel jittery.
     if (now - lastFollowAnimationAtRef.current < 2200) {
       return;
     }
 
     lastFollowAnimationAtRef.current = now;
-    map.flyTo(followPoint, Math.max(map.getZoom(), 15), {
-      duration: 0.9,
-      easeLinearity: 0.25,
-      noMoveStart: true,
-    });
-  }, [followPoint, map]);
+    map.panTo(toGoogleLatLng(currentPosition));
+    if ((map.getZoom() || 13) < 15) {
+      map.setZoom(15);
+    }
+  }, [currentPosition, routeOptions, selectedRouteId, showRouteDetails]);
 
-  return null;
+  return <div ref={mapElementRef} className={className} />;
 }
 
 export default function ResponderIncidentDetails() {
@@ -182,6 +520,7 @@ export default function ResponderIncidentDetails() {
   const [routeError, setRouteError] = useState<string | null>(null);
   const [routeRefreshToken, setRouteRefreshToken] = useState(0);
   const lastRouteKeyRef = useRef<string | null>(null);
+  const lastOffRouteRerouteAtRef = useRef(0);
   const [acceptedLocally, setAcceptedLocally] = useState(false);
   const [declineOpen, setDeclineOpen] = useState(false);
   const [declineReason, setDeclineReason] = useState("");
@@ -194,7 +533,7 @@ export default function ResponderIncidentDetails() {
     return [incident.coordinates.lat, incident.coordinates.lng] as LatLng;
   }, [incident?.coordinates?.lat, incident?.coordinates?.lng]);
   const awaitingDecision = incident?.responderAssignmentStatus === "assigned";
-  const hasGeoapifyKey = typeof GEOAPIFY_API_KEY === "string" && GEOAPIFY_API_KEY.trim().length > 0;
+  const hasGoogleMapsKey = typeof GOOGLE_MAPS_API_KEY === "string" && GOOGLE_MAPS_API_KEY.trim().length > 0;
   const currentLat = currentPosition?.[0] ?? null;
   const currentLng = currentPosition?.[1] ?? null;
   const destinationLat = destination?.[0] ?? null;
@@ -295,6 +634,40 @@ export default function ResponderIncidentDetails() {
   }, []);
 
   useEffect(() => {
+    if (!showRouteDetails) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setRouteRefreshToken((current) => current + 1);
+    }, ROUTE_OPTIMIZATION_REFRESH_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [showRouteDetails]);
+
+  useEffect(() => {
+    if (!showRouteDetails || !currentPosition || !selectedRoute || selectedRoute.points.length < 2) {
+      return;
+    }
+
+    const distanceFromRoute = distanceToPolylineMeters(currentPosition, selectedRoute.points);
+    if (!Number.isFinite(distanceFromRoute) || distanceFromRoute < OFF_ROUTE_REROUTE_METERS) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastOffRouteRerouteAtRef.current < 15000) {
+      return;
+    }
+
+    lastOffRouteRerouteAtRef.current = now;
+    lastRouteKeyRef.current = null;
+    setRouteRefreshToken((current) => current + 1);
+  }, [currentPosition, selectedRoute, showRouteDetails]);
+
+  useEffect(() => {
     if (
       currentLat === null ||
       currentLng === null ||
@@ -309,8 +682,8 @@ export default function ResponderIncidentDetails() {
       return;
     }
 
-    if (!hasGeoapifyKey) {
-      setRouteError("Geoapify key is missing. Showing straight-line fallback route.");
+    if (!hasGoogleMapsKey) {
+      setRouteError("Google Maps key is missing. Showing straight-line fallback route.");
       setRouteOptions([
         {
           id: "fallback",
@@ -329,101 +702,80 @@ export default function ResponderIncidentDetails() {
       return;
     }
 
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+    let cancelled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (cancelled) return;
+      setRouteError("Routing request timed out. Showing approximate route.");
+      setRouteOptions([
+        {
+          id: "fallback",
+          points: [
+            [currentLat, currentLng],
+            [destinationLat, destinationLng],
+          ],
+          distance: fallbackDistance,
+          duration: fallbackDuration,
+          instructions: [],
+          source: "fallback",
+        },
+      ]);
+      setSelectedRouteId("fallback");
+      setRouteLoading(false);
+      lastRouteKeyRef.current = routeKey;
+      cancelled = true;
+    }, 12000);
 
     async function fetchRoute() {
       try {
         setRouteLoading(true);
         setRouteError(null);
 
-        const waypoints = `${currentLat},${currentLng}|${destinationLat},${destinationLng}`;
-        const url = `https://api.geoapify.com/v1/routing?waypoints=${encodeURIComponent(
-          waypoints
-        )}&mode=drive&apiKey=${GEOAPIFY_API_KEY}`;
-
-        const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) {
-          throw new Error(`Geoapify routing failed (${response.status}).`);
+        await loadGoogleMapsApi();
+        if (cancelled) {
+          return;
         }
 
-        const data = await response.json();
-        const features: Array<{
-          geometry?: { type?: string; coordinates?: unknown };
-          properties?: { distance?: unknown; time?: unknown };
-        }> = Array.isArray(data?.features) ? data.features : [];
-
-        if (!features.length) {
-          throw new Error("No route was returned by Geoapify.");
-        }
-
-        const parsedRoutes: RouteOption[] = [];
-
-        features.forEach((feature, index) => {
-          const geometry = feature.geometry;
-          const coordinates: LatLng[] = [];
-          const instructions: RouteInstruction[] = [];
-          const properties =
-            feature.properties && typeof feature.properties === "object"
-              ? (feature.properties as Record<string, unknown>)
-              : {};
-
-          const legs = Array.isArray(properties.legs) ? (properties.legs as Array<Record<string, unknown>>) : [];
-          legs.forEach((leg, legIndex) => {
-            const steps = Array.isArray(leg.steps) ? (leg.steps as Array<Record<string, unknown>>) : [];
-            steps.forEach((step, stepIndex) => {
-              const instructionContainer =
-                step.instruction && typeof step.instruction === "object"
-                  ? (step.instruction as Record<string, unknown>)
-                  : null;
-
-              const text =
-                normalizeInstructionText(instructionContainer?.text) ||
-                normalizeInstructionText(step.instruction) ||
-                normalizeInstructionText(step.maneuver) ||
-                normalizeInstructionText(step.name) ||
-                null;
-
-              if (!text) {
-                return;
-              }
-
-              instructions.push({
-                id: `geoapify-${index}-leg-${legIndex}-step-${stepIndex}`,
-                text,
-                distance: toNullableNumber(step.distance),
-                duration: toNullableNumber(step.time),
-              });
-            });
-          });
-
-          if (geometry?.type === "LineString" && Array.isArray(geometry.coordinates)) {
-            (geometry.coordinates as Array<[number, number]>).forEach((point) => {
-              coordinates.push([point[1], point[0]]);
-            });
-          }
-
-          if (geometry?.type === "MultiLineString" && Array.isArray(geometry.coordinates)) {
-            (geometry.coordinates as Array<Array<[number, number]>>).forEach((segment) => {
-              segment.forEach((point) => {
-                coordinates.push([point[1], point[0]]);
-              });
-            });
-          }
-
-          if (!coordinates.length) {
-            return;
-          }
-
-          parsedRoutes.push({
-            id: `geoapify-${index}`,
-            points: coordinates,
-            distance: toNullableNumber(feature.properties?.distance),
-            duration: toNullableNumber(feature.properties?.time),
-            instructions,
-            source: "geoapify",
-          });
+        const directionsService = new google.maps.DirectionsService();
+        const result = await directionsService.route({
+          origin: { lat: currentLat, lng: currentLng },
+          destination: { lat: destinationLat, lng: destinationLng },
+          provideRouteAlternatives: true,
+          travelMode: google.maps.TravelMode.DRIVING,
+          drivingOptions: {
+            departureTime: new Date(),
+            trafficModel: google.maps.TrafficModel.BEST_GUESS,
+          },
+          region: "PH",
+          optimizeWaypoints: false,
         });
+
+        if (cancelled) {
+          return;
+        }
+
+        const parsedRoutes: RouteOption[] = (result.routes || []).map((route, index) => {
+          const leg = route.legs?.[0];
+          const points = (route.overview_path || []).map((point) => [point.lat(), point.lng()] as LatLng);
+
+          const instructions: RouteInstruction[] = (leg?.steps || []).map((step, stepIndex) => {
+            const text = normalizeInstructionText(stripHtml(step.instructions || "")) || "Continue";
+            return {
+              id: `google-${index}-step-${stepIndex}`,
+              text,
+              distance: toNullableNumber(step.distance?.value),
+              duration: toNullableNumber(step.duration?.value),
+            };
+          });
+
+          return {
+            id: `google-${index}`,
+            points,
+            distance: toNullableNumber(leg?.distance?.value),
+            duration: toNullableNumber(leg?.duration_in_traffic?.value ?? leg?.duration?.value),
+            instructions,
+            source: "google",
+          };
+        }).filter((route) => route.points.length > 0);
 
         if (!parsedRoutes.length) {
           throw new Error("Route geometry was empty.");
@@ -444,52 +796,39 @@ export default function ResponderIncidentDetails() {
         });
         lastRouteKeyRef.current = routeKey;
       } catch (error) {
-        if ((error as Error).name !== "AbortError") {
-          setRouteError((error as Error).message || "Unable to compute route.");
-          setRouteOptions([
-            {
-              id: "fallback",
-              points: [
-                [currentLat, currentLng],
-                [destinationLat, destinationLng],
-              ],
-              distance: fallbackDistance,
-              duration: fallbackDuration,
-              instructions: [],
-              source: "fallback",
-            },
-          ]);
-          setSelectedRouteId("fallback");
-          lastRouteKeyRef.current = routeKey;
-        } else {
-          setRouteError("Routing request timed out. Showing approximate route.");
-          setRouteOptions([
-            {
-              id: "fallback",
-              points: [
-                [currentLat, currentLng],
-                [destinationLat, destinationLng],
-              ],
-              distance: fallbackDistance,
-              duration: fallbackDuration,
-              instructions: [],
-              source: "fallback",
-            },
-          ]);
-          setSelectedRouteId("fallback");
-          lastRouteKeyRef.current = routeKey;
+        if (cancelled) {
+          return;
         }
+
+        setRouteError((error as Error).message || "Unable to compute route.");
+        setRouteOptions([
+          {
+            id: "fallback",
+            points: [
+              [currentLat, currentLng],
+              [destinationLat, destinationLng],
+            ],
+            distance: fallbackDistance,
+            duration: fallbackDuration,
+            instructions: [],
+            source: "fallback",
+          },
+        ]);
+        setSelectedRouteId("fallback");
+        lastRouteKeyRef.current = routeKey;
       } finally {
         window.clearTimeout(timeoutId);
-        setRouteLoading(false);
+        if (!cancelled) {
+          setRouteLoading(false);
+        }
       }
     }
 
-    fetchRoute();
+    void fetchRoute();
 
     return () => {
+      cancelled = true;
       window.clearTimeout(timeoutId);
-      controller.abort();
     };
   }, [
     currentLat,
@@ -498,7 +837,7 @@ export default function ResponderIncidentDetails() {
     destinationLng,
     fallbackDistance,
     fallbackDuration,
-    hasGeoapifyKey,
+    hasGoogleMapsKey,
     routeRefreshToken,
   ]);
 
@@ -803,60 +1142,24 @@ export default function ResponderIncidentDetails() {
           </div>
         )}
 
-        {destination && mapCenter ? (
+        {destination && mapCenter && hasGoogleMapsKey ? (
           <div className="h-72 overflow-hidden rounded-xl border border-white/60 bg-white/65 backdrop-blur-sm">
-            <MapContainer center={mapCenter} zoom={13} scrollWheelZoom className="h-full w-full">
-              <TileLayer
-                url={
-                  hasGeoapifyKey
-                    ? `https://maps.geoapify.com/v1/tile/osm-carto/{z}/{x}/{y}.png?apiKey=${GEOAPIFY_API_KEY}`
-                    : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                }
-                attribution={
-                  hasGeoapifyKey
-                    ? "&copy; OpenStreetMap contributors | Tiles by Geoapify"
-                    : "&copy; OpenStreetMap contributors"
-                }
-              />
-              {currentPosition ? (
-                <Marker position={currentPosition} icon={responderMarkerIcon}>
-                  <Popup>Your current location</Popup>
-                </Marker>
-              ) : null}
-              <Marker position={destination} icon={responderMarkerIcon}>
-                <Popup>Incident scene</Popup>
-              </Marker>
-              {showRouteDetails && routeOptions.length > 0
-                ? routeOptions.map((route) => {
-                    const isSelected = selectedRoute?.id === route.id;
-                    const isFastest = fastestRouteId === route.id;
-
-                    return (
-                      <Polyline
-                        key={route.id}
-                        positions={route.points}
-                        pathOptions={{
-                          color: isSelected ? "#f97316" : isFastest ? "#fb923c" : "#9ca3af",
-                          weight: isSelected ? 6 : 4,
-                          opacity: isSelected ? 0.95 : isFastest ? 0.65 : 0.4,
-                          dashArray: isSelected ? undefined : "6 8",
-                        }}
-                      />
-                    );
-                  })
-                : null}
-              {showRouteDetails && currentPosition ? (
-                <RouteViewport
-                  points={
-                    selectedRoute?.points?.length
-                      ? selectedRoute.points
-                      : [currentPosition, destination]
-                  }
-                  followPoint={currentPosition}
-                />
-              ) : null}
-            </MapContainer>
+            <ResponderIncidentGoogleMap
+              mapCenter={mapCenter}
+              currentPosition={currentPosition}
+              destination={destination}
+              routeOptions={routeOptions}
+              selectedRouteId={selectedRouteId}
+              fastestRouteId={fastestRouteId}
+              showRouteDetails={showRouteDetails}
+              zoom={13}
+              className="h-full w-full"
+            />
           </div>
+        ) : destination && mapCenter ? (
+          <p className="text-xs text-muted-foreground">
+            Add VITE_GOOGLE_MAPS_API_KEY to enable live map rendering.
+          </p>
         ) : (
           <p className="text-xs text-muted-foreground">Incident coordinates are unavailable.</p>
         )}
@@ -867,9 +1170,9 @@ export default function ResponderIncidentDetails() {
           </p>
         )}
 
-        {!hasGeoapifyKey && showRouteDetails && (
+        {!hasGoogleMapsKey && showRouteDetails && (
           <p className="text-xs text-muted-foreground">
-            Add VITE_GEOAPIFY_API_KEY to improve route optimization accuracy.
+            Add VITE_GOOGLE_MAPS_API_KEY to enable optimized route alternatives.
           </p>
         )}
       </div>
@@ -896,62 +1199,23 @@ export default function ResponderIncidentDetails() {
         ? createPortal(
         <div className="fixed inset-0 z-[120] bg-black/55 backdrop-blur-[2px] animate-map-overlay">
           <div className="relative h-full w-full animate-map-zoom-in will-change-transform">
-            <MapContainer
-              center={mapCenter}
-              zoom={14}
-              scrollWheelZoom
-              className="absolute inset-0 h-full w-full"
-            >
-              <TileLayer
-                url={
-                  hasGeoapifyKey
-                    ? `https://maps.geoapify.com/v1/tile/osm-carto/{z}/{x}/{y}.png?apiKey=${GEOAPIFY_API_KEY}`
-                    : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                }
-                attribution={
-                  hasGeoapifyKey
-                    ? "&copy; OpenStreetMap contributors | Tiles by Geoapify"
-                    : "&copy; OpenStreetMap contributors"
-                }
+            {hasGoogleMapsKey ? (
+              <ResponderIncidentGoogleMap
+                mapCenter={mapCenter}
+                currentPosition={currentPosition}
+                destination={destination}
+                routeOptions={routeOptions}
+                selectedRouteId={selectedRouteId}
+                fastestRouteId={fastestRouteId}
+                showRouteDetails={showRouteDetails}
+                zoom={14}
+                className="absolute inset-0 h-full w-full"
               />
-              {currentPosition ? (
-                <Marker position={currentPosition} icon={responderMarkerIcon}>
-                  <Popup>Your current location</Popup>
-                </Marker>
-              ) : null}
-              <Marker position={destination} icon={responderMarkerIcon}>
-                <Popup>Incident scene</Popup>
-              </Marker>
-              {showRouteDetails && routeOptions.length > 0
-                ? routeOptions.map((route) => {
-                    const isSelected = selectedRoute?.id === route.id;
-                    const isFastest = fastestRouteId === route.id;
-
-                    return (
-                      <Polyline
-                        key={route.id}
-                        positions={route.points}
-                        pathOptions={{
-                          color: isSelected ? "#f97316" : isFastest ? "#fb923c" : "#9ca3af",
-                          weight: isSelected ? 6 : 4,
-                          opacity: isSelected ? 0.95 : isFastest ? 0.65 : 0.4,
-                          dashArray: isSelected ? undefined : "6 8",
-                        }}
-                      />
-                    );
-                  })
-                : null}
-              {showRouteDetails && currentPosition ? (
-                <RouteViewport
-                  points={
-                    selectedRoute?.points?.length
-                      ? selectedRoute.points
-                      : [currentPosition, destination]
-                  }
-                  followPoint={currentPosition}
-                />
-              ) : null}
-            </MapContainer>
+            ) : (
+              <div className="absolute inset-0 flex items-center justify-center bg-slate-950/85 text-sm text-slate-100">
+                Add VITE_GOOGLE_MAPS_API_KEY to show map.
+              </div>
+            )}
           </div>
 
           <div className="pointer-events-none absolute inset-0 z-[500]">

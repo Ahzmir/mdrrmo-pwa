@@ -192,6 +192,24 @@ async function updateResponderLiveLocation(
   }, { merge: true });
 }
 
+async function updateResidentLiveLocation(
+  uid: string,
+  latitude: number,
+  longitude: number,
+  accuracy: number | null
+) {
+  const residentRef = doc(db, "residents", uid);
+  await updateDoc(residentRef, {
+    liveLocation: {
+      latitude,
+      longitude,
+      accuracy,
+    },
+    liveLocationUpdatedAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+}
+
 function getDistanceMeters(
   fromLat: number,
   fromLng: number,
@@ -399,46 +417,85 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const currentUid = residentUid;
     let cancelled = false;
+    let lastAcceptedLocation: { lat: number; lng: number; accuracy: number | null } | null = null;
+    let lastUploadAt = 0;
 
-    const pushLiveLocation = () => {
-      navigator.geolocation.getCurrentPosition(
-        async (position) => {
-          if (cancelled || !auth.currentUser || auth.currentUser.uid !== currentUid) {
-            return;
-          }
+    const maybeUploadLocation = async (position: GeolocationPosition) => {
+      if (cancelled || !auth.currentUser || auth.currentUser.uid !== currentUid) {
+        return;
+      }
 
-          try {
-            const residentRef = doc(db, "residents", currentUid);
-            await updateDoc(residentRef, {
-              liveLocation: {
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude,
-                accuracy: position.coords.accuracy ?? null,
-              },
-              liveLocationUpdatedAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-          } catch {
-            // Ignore transient location sync failures.
-          }
-        },
-        () => {
-          // Ignore geolocation read failures to avoid blocking auth.
-        },
-        {
-          enableHighAccuracy: true,
-          timeout: 10000,
-          maximumAge: 0,
+      const latitude = position.coords.latitude;
+      const longitude = position.coords.longitude;
+      const accuracy = Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : null;
+      const now = Date.now();
+
+      const previous = lastAcceptedLocation;
+      if (previous) {
+        const distance = getDistanceMeters(previous.lat, previous.lng, latitude, longitude);
+        const previousAccuracy = previous.accuracy ?? Number.POSITIVE_INFINITY;
+        const currentAccuracy = accuracy ?? Number.POSITIVE_INFINITY;
+
+        const likelyDrift =
+          distance > 120 &&
+          currentAccuracy > 120 &&
+          currentAccuracy > previousAccuracy * 1.35;
+
+        if (likelyDrift) {
+          return;
         }
-      );
+
+        const minUploadIntervalMs = 3000;
+        const minDistanceMeters = 6;
+        const isSmallMove = distance < minDistanceMeters;
+        const tooSoon = now - lastUploadAt < minUploadIntervalMs;
+
+        if (isSmallMove && tooSoon) {
+          return;
+        }
+      }
+
+      try {
+        await updateResidentLiveLocation(currentUid, latitude, longitude, accuracy);
+        lastAcceptedLocation = { lat: latitude, lng: longitude, accuracy };
+        lastUploadAt = now;
+      } catch {
+        // Ignore transient location sync failures.
+      }
     };
 
-    pushLiveLocation();
-    const intervalId = window.setInterval(pushLiveLocation, 5000);
+    const geoOptions: PositionOptions = {
+      enableHighAccuracy: true,
+      timeout: 15000,
+      maximumAge: 2000,
+    };
+
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        void maybeUploadLocation(position);
+      },
+      () => {
+        // Ignore geolocation watch failures and rely on interval fallback.
+      },
+      geoOptions
+    );
+
+    const pollId = window.setInterval(() => {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          void maybeUploadLocation(position);
+        },
+        () => {
+          // Ignore transient geolocation read failures.
+        },
+        geoOptions
+      );
+    }, 10000);
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      navigator.geolocation.clearWatch(watchId);
+      window.clearInterval(pollId);
     };
   }, [user?.id, user?.role]);
 
