@@ -5,6 +5,15 @@ import { useIncidents } from "@/hooks/useIncidents";
 import { CategoryIcon } from "@/components/CategoryIcon";
 import { StatusBadge } from "@/components/StatusBadge";
 import { SmsFallback } from "@/components/SmsFallback";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { auth, db } from "@/lib/firebase";
 import { Timestamp, collection, doc, limit, onSnapshot, query, serverTimestamp, setDoc, updateDoc, where } from "firebase/firestore";
 import {
@@ -44,6 +53,10 @@ function mapGeolocationError(error: GeolocationPositionError | { message?: strin
   }
 
   return error.message || "Unable to get device location.";
+}
+
+function assignmentSnapshotValue(incident: IncidentReport) {
+  return `${incident.status}|${incident.responderAssignmentStatus || "none"}`;
 }
 
 async function patchResponderLocationViaRest(
@@ -185,7 +198,12 @@ export default function ResponderDashboard() {
   const [syncLogLines, setSyncLogLines] = useState<string[]>([]);
   const [lastSuccessfulSyncAt, setLastSuccessfulSyncAt] = useState<Date | null>(null);
   const [nowTick, setNowTick] = useState(Date.now());
+  const [incomingAssignedIncident, setIncomingAssignedIncident] = useState<IncidentReport | null>(null);
+  const [incomingAssignedOpen, setIncomingAssignedOpen] = useState(false);
   const syncInFlightRef = useRef(false);
+  const hasBootstrappedAssignmentFeedRef = useRef(false);
+  const assignmentSnapshotByIdRef = useRef<Map<string, string>>(new Map());
+  const assignmentAlertAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const appendSyncLog = useCallback((message: string) => {
     const timestamp = new Date().toLocaleTimeString([], {
@@ -199,6 +217,22 @@ export default function ResponderDashboard() {
       const next = [...current, line];
       return next.slice(-14);
     });
+  }, []);
+
+  useEffect(() => {
+    assignmentAlertAudioRef.current = new Audio("/audio/alert.mp3");
+    assignmentAlertAudioRef.current.loop = true;
+    assignmentAlertAudioRef.current.preload = "auto";
+
+    return () => {
+      if (!assignmentAlertAudioRef.current) {
+        return;
+      }
+
+      assignmentAlertAudioRef.current.pause();
+      assignmentAlertAudioRef.current.currentTime = 0;
+      assignmentAlertAudioRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -559,6 +593,101 @@ export default function ResponderDashboard() {
     };
   }, [responderUid, syncResponderLocation]);
 
+  useEffect(() => {
+    if (!responderUid) {
+      hasBootstrappedAssignmentFeedRef.current = false;
+      assignmentSnapshotByIdRef.current = new Map();
+      setIncomingAssignedOpen(false);
+      setIncomingAssignedIncident(null);
+      return;
+    }
+
+    const nextSnapshotById = new Map<string, string>();
+    incidents.forEach((incident) => {
+      nextSnapshotById.set(incident.id, assignmentSnapshotValue(incident));
+    });
+
+    if (!hasBootstrappedAssignmentFeedRef.current) {
+      hasBootstrappedAssignmentFeedRef.current = true;
+      assignmentSnapshotByIdRef.current = nextSnapshotById;
+      return;
+    }
+
+    const newlyAssignedIncident = incidents.find((incident) => {
+      if (incident.responderAssignmentStatus !== "assigned") {
+        return false;
+      }
+
+      const previousSnapshot = assignmentSnapshotByIdRef.current.get(incident.id);
+      const currentSnapshot = nextSnapshotById.get(incident.id);
+      return previousSnapshot !== currentSnapshot;
+    });
+
+    assignmentSnapshotByIdRef.current = nextSnapshotById;
+
+    if (newlyAssignedIncident) {
+      setIncomingAssignedIncident(newlyAssignedIncident);
+      setIncomingAssignedOpen(true);
+    }
+  }, [incidents, responderUid]);
+
+  useEffect(() => {
+    if (!incomingAssignedIncident) {
+      return;
+    }
+
+    const nextIncoming = incidents.find((incident) => incident.id === incomingAssignedIncident.id) || null;
+    if (!nextIncoming) {
+      setIncomingAssignedOpen(false);
+      setIncomingAssignedIncident(null);
+      return;
+    }
+
+    if (nextIncoming !== incomingAssignedIncident) {
+      setIncomingAssignedIncident(nextIncoming);
+    }
+
+    if (nextIncoming.responderAssignmentStatus !== "assigned") {
+      setIncomingAssignedOpen(false);
+      setIncomingAssignedIncident(null);
+    }
+  }, [incidents, incomingAssignedIncident]);
+
+  useEffect(() => {
+    const alertAudio = assignmentAlertAudioRef.current;
+    if (!alertAudio) {
+      return;
+    }
+
+    if (incomingAssignedOpen && incomingAssignedIncident?.responderAssignmentStatus === "assigned") {
+      alertAudio.currentTime = 0;
+      void alertAudio.play().catch(() => {
+        // Browser autoplay restrictions may block playback until first user interaction.
+      });
+      return;
+    }
+
+    alertAudio.pause();
+    alertAudio.currentTime = 0;
+  }, [incomingAssignedIncident?.id, incomingAssignedIncident?.responderAssignmentStatus, incomingAssignedOpen]);
+
+  function handleIncomingAssignmentDialogChange(open: boolean) {
+    setIncomingAssignedOpen(open);
+    if (!open) {
+      setIncomingAssignedIncident(null);
+    }
+  }
+
+  function handleReviewIncomingAssignment() {
+    if (!incomingAssignedIncident) {
+      return;
+    }
+
+    navigate(`/responder/incidents/${incomingAssignedIncident.id}`);
+    setIncomingAssignedOpen(false);
+    setIncomingAssignedIncident(null);
+  }
+
   const locationSharingState = useMemo(() => {
     if (!navigator.geolocation) {
       return { label: "Live location unavailable on this device", tone: "text-destructive" };
@@ -666,6 +795,37 @@ export default function ResponderDashboard() {
           </div>
         </div>
       )}
+
+      <Dialog open={incomingAssignedOpen} onOpenChange={handleIncomingAssignmentDialogChange}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>New Incident Assignment</DialogTitle>
+            <DialogDescription>
+              {incomingAssignedIncident
+                ? `${incomingAssignedIncident.id} has been assigned to you.`
+                : "An incident has been assigned to you."}
+            </DialogDescription>
+          </DialogHeader>
+
+          {incomingAssignedIncident ? (
+            <div className="space-y-2 rounded-md border bg-muted/20 p-3">
+              <div className="flex items-center gap-2">
+                <CategoryIcon category={incomingAssignedIncident.category} size={16} showLabel />
+                <StatusBadge status={incomingAssignedIncident.status} />
+              </div>
+              <p className="line-clamp-2 text-sm text-muted-foreground">{incomingAssignedIncident.description}</p>
+              <p className="text-xs text-muted-foreground">{incomingAssignedIncident.location}</p>
+            </div>
+          ) : null}
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => handleIncomingAssignmentDialogChange(false)}>
+              Dismiss
+            </Button>
+            <Button onClick={handleReviewIncomingAssignment}>View Incident</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
     </div>
   );

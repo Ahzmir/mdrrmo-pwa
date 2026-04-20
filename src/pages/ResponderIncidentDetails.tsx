@@ -109,6 +109,17 @@ function getDestinationLabel(locationText: string) {
   return trimmed.length > 26 ? `${trimmed.slice(0, 23)}...` : trimmed;
 }
 
+function buildExternalGoogleDirectionsUrl(destination: LatLng, currentPosition: LatLng | null) {
+  const destinationParam = `${destination[0].toFixed(6)},${destination[1].toFixed(6)}`;
+
+  if (!currentPosition) {
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destinationParam)}`;
+  }
+
+  const originParam = `${currentPosition[0].toFixed(6)},${currentPosition[1].toFixed(6)}`;
+  return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originParam)}&destination=${encodeURIComponent(destinationParam)}&travelmode=driving&dir_action=navigate`;
+}
+
 function haversineMeters(a: LatLng, b: LatLng) {
   const R = 6371000;
   const toRad = (value: number) => (value * Math.PI) / 180;
@@ -522,6 +533,9 @@ function ResponderIncidentGoogleMap({
   const sharedInfoWindowRef = useRef<google.maps.InfoWindow | null>(null);
   const hasIntroAnimatedRef = useRef(false);
   const lastFollowAnimationAtRef = useRef(0);
+  const hasInitializedOverviewCameraRef = useRef(false);
+  const previousShowRouteDetailsRef = useRef(showRouteDetails);
+  const lastHandledFocusDestinationTokenRef = useRef(0);
   const lastResponderPointRef = useRef<LatLng | null>(null);
   const lastHeadingRef = useRef<number>(0);
 
@@ -611,10 +625,20 @@ function ResponderIncidentGoogleMap({
       return;
     }
 
+    const switchedFromRouteToOverview =
+      previousShowRouteDetailsRef.current === true && showRouteDetails === false;
+
     if (!showRouteDetails) {
-      map.setZoom(zoom);
-      map.panTo(toGoogleLatLng(mapCenter));
+      // Keep user-controlled zoom while panning in overview mode.
+      // Auto-frame only once on initial load or when leaving route mode.
+      if (!hasInitializedOverviewCameraRef.current || switchedFromRouteToOverview) {
+        map.setZoom(zoom);
+        map.panTo(toGoogleLatLng(mapCenter));
+        hasInitializedOverviewCameraRef.current = true;
+      }
     }
+
+    previousShowRouteDetailsRef.current = showRouteDetails;
   }, [mapCenter, showRouteDetails, zoom]);
 
   useEffect(() => {
@@ -933,6 +957,16 @@ function ResponderIncidentGoogleMap({
     if (!map) {
       return;
     }
+
+    if (focusDestinationToken <= 0) {
+      return;
+    }
+
+    if (lastHandledFocusDestinationTokenRef.current === focusDestinationToken) {
+      return;
+    }
+
+    lastHandledFocusDestinationTokenRef.current = focusDestinationToken;
 
     if (currentPosition) {
       const bounds = buildBounds([currentPosition, destination]);
@@ -1335,8 +1369,11 @@ export default function ResponderIncidentDetails() {
     incident.status === "en_route" ||
     incident.status === "on_scene" ||
     incident.status === "resolved";
-  const canGetDirections = hasGoogleMapsKey && !awaitingDecision && (acceptedLocally || acceptedOrBeyond);
+  const canGetDirections = !awaitingDecision && (acceptedLocally || acceptedOrBeyond);
   const mapCenter = currentPosition || destination;
+  const externalGoogleDirectionsUrl = destination
+    ? buildExternalGoogleDirectionsUrl(destination, currentPosition)
+    : null;
 
   async function handleAcceptIncident() {
     setSubmittingDecision(true);
@@ -1480,6 +1517,20 @@ export default function ResponderIncidentDetails() {
           <button
             type="button"
             onClick={() => {
+              if (!hasGoogleMapsKey) {
+                if (!destination) {
+                  toast.error("Incident coordinates are unavailable.");
+                  return;
+                }
+
+                const externalUrl = buildExternalGoogleDirectionsUrl(destination, currentPosition);
+                if (typeof window !== "undefined") {
+                  window.location.assign(externalUrl);
+                }
+                toast.info("Google Maps key is missing in this deployment. Opening Google Maps navigation.");
+                return;
+              }
+
               if (fastestRouteId) {
                 setSelectedRouteId(fastestRouteId);
               }
@@ -1513,7 +1564,7 @@ export default function ResponderIncidentDetails() {
           </div>
         )}
 
-        {routeLoading && showRouteDetails && (
+        {routeLoading && showRouteDetails && routeOptions.length === 0 && (
           <div className="flex items-center gap-2 text-sm text-muted-foreground animate-slide-up">
             <Loader2 size={16} className="animate-spin" />
             Calculating drive route to scene...
@@ -1534,6 +1585,19 @@ export default function ResponderIncidentDetails() {
                 Google optimized routes update live as you move.
               </p>
               <div className="flex items-center gap-2">
+                {externalGoogleDirectionsUrl && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (typeof window !== "undefined") {
+                        window.location.assign(externalGoogleDirectionsUrl);
+                      }
+                    }}
+                    className="rounded-lg border border-orange-300/80 bg-orange-100/85 px-2.5 py-1 text-[11px] font-semibold text-orange-800 hover:bg-orange-100"
+                  >
+                    Open Google Nav
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setFocusDestinationToken((current) => current + 1)}
@@ -1727,6 +1791,19 @@ export default function ResponderIncidentDetails() {
                 <ArrowLeft size={14} />
                 Back
               </button>
+              {externalGoogleDirectionsUrl && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (typeof window !== "undefined") {
+                      window.location.assign(externalGoogleDirectionsUrl);
+                    }
+                  }}
+                  className="rounded-full border border-orange-300/80 bg-orange-100/90 px-3 py-1.5 text-xs font-semibold text-orange-800 shadow-lg backdrop-blur-md"
+                >
+                  Open Google Nav
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setFocusDestinationToken((current) => current + 1)}
@@ -1778,13 +1855,13 @@ export default function ResponderIncidentDetails() {
                   <div className="rounded-xl border border-white/70 bg-white/70 px-3 py-2">
                     <p className="text-[10px] uppercase tracking-wider text-muted-foreground">ETA</p>
                     <p className="text-sm font-bold text-foreground">
-                      {routeLoading ? "Calculating..." : shownDuration !== null ? formatDuration(shownDuration) : "N/A"}
+                      {shownDuration !== null ? formatDuration(shownDuration) : "N/A"}
                     </p>
                   </div>
                   <div className="rounded-xl border border-white/70 bg-white/70 px-3 py-2">
                     <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Distance</p>
                     <p className="text-sm font-bold text-foreground">
-                      {routeLoading ? "Calculating..." : shownDistance !== null ? formatDistance(shownDistance) : "N/A"}
+                      {shownDistance !== null ? formatDistance(shownDistance) : "N/A"}
                     </p>
                   </div>
                 </div>
