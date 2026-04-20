@@ -120,11 +120,19 @@ export default function ReportForm() {
     return "DISASTER";
   }
 
-  function normalizeOneLine(value: string) {
+  function normalizeSmsFieldValue(value: string) {
     return value
       .replace(/[;|]+/g, " ")
       .replace(/\r\n|\n|\r/g, " ")
       .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function normalizeOneLine(value: string) {
+    return value
+      .replace(/\r\n|\n|\r/g, " ")
+      .replace(/\s+/g, " ")
+      .replace(/\s*;\s*/g, "; ")
       .trim();
   }
 
@@ -137,9 +145,9 @@ export default function ReportForm() {
       return null;
     }
 
-    const oneLineLocation = normalizeOneLine(location);
-    const oneLineDescription = normalizeOneLine(description) || "N/A";
-    const oneLineReporter = normalizeOneLine(user?.name || "Resident");
+    const oneLineLocation = normalizeSmsFieldValue(location);
+    const oneLineDescription = normalizeSmsFieldValue(description) || "N/A";
+    const oneLineReporter = normalizeSmsFieldValue(user?.name || "Resident");
 
     const messageLines = [
       "MDRRMO INCIDENT REPORT",
