@@ -155,13 +155,36 @@ export default function ReportForm() {
   }
 
   function launchSmsFallback(message: string) {
+    const recipient = smsFallbackNumber.replace(/[^\d+]/g, "");
     const encodedBody = encodeURIComponent(normalizeOneLine(message));
     const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent);
     const smsUri = isIos
-      ? `sms:${smsFallbackNumber}&body=${encodedBody}`
-      : `sms:${smsFallbackNumber}?body=${encodedBody}`;
+      ? `sms:${recipient}&body=${encodedBody}`
+      : `sms:${recipient}?body=${encodedBody}`;
 
-    window.location.href = smsUri;
+    const openUri = (uri: string) => {
+      try {
+        window.location.href = uri;
+      } catch {
+        const anchor = document.createElement("a");
+        anchor.href = uri;
+        anchor.style.display = "none";
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+      }
+    };
+
+    openUri(smsUri);
+
+    // Android fallback for environments where sms: URI does not trigger reliably.
+    if (!isIos) {
+      window.setTimeout(() => {
+        if (!document.hidden) {
+          openUri(`smsto:${recipient}?body=${encodedBody}`);
+        }
+      }, 250);
+    }
   }
 
   function queueOfflineSmsHistory(message: string) {
