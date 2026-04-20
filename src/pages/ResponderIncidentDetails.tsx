@@ -474,6 +474,133 @@ function distanceToPolylineMeters(point: LatLng, polyline: LatLng[]) {
   return minDistance;
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function buildOpenStreetMapEmbedUrl({
+  mapCenter,
+  destination,
+  currentPosition,
+}: {
+  mapCenter: LatLng;
+  destination: LatLng;
+  currentPosition: LatLng | null;
+}) {
+  const points = currentPosition
+    ? [mapCenter, destination, currentPosition]
+    : [mapCenter, destination];
+
+  const latitudes = points.map((point) => point[0]);
+  const longitudes = points.map((point) => point[1]);
+
+  const rawMinLat = Math.min(...latitudes);
+  const rawMaxLat = Math.max(...latitudes);
+  const rawMinLng = Math.min(...longitudes);
+  const rawMaxLng = Math.max(...longitudes);
+
+  const latSpan = Math.max(0.01, rawMaxLat - rawMinLat);
+  const lngSpan = Math.max(0.01, rawMaxLng - rawMinLng);
+  const latPadding = latSpan * 0.35;
+  const lngPadding = lngSpan * 0.35;
+
+  const minLat = clamp(rawMinLat - latPadding, -85, 85);
+  const maxLat = clamp(rawMaxLat + latPadding, -85, 85);
+  const minLng = clamp(rawMinLng - lngPadding, -180, 180);
+  const maxLng = clamp(rawMaxLng + lngPadding, -180, 180);
+
+  const bbox = [
+    minLng.toFixed(6),
+    minLat.toFixed(6),
+    maxLng.toFixed(6),
+    maxLat.toFixed(6),
+  ].join(",");
+  const marker = `${destination[0].toFixed(6)},${destination[1].toFixed(6)}`;
+
+  return `https://www.openstreetmap.org/export/embed.html?bbox=${encodeURIComponent(bbox)}&layer=mapnik&marker=${encodeURIComponent(marker)}`;
+}
+
+function buildOpenStreetMapUrl(destination: LatLng) {
+  const lat = destination[0].toFixed(6);
+  const lng = destination[1].toFixed(6);
+  return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lng}#map=16/${lat}/${lng}`;
+}
+
+function buildGoogleDirectionsUrl(destination: LatLng, currentPosition: LatLng | null) {
+  const destinationParam = `${destination[0].toFixed(6)},${destination[1].toFixed(6)}`;
+  if (!currentPosition) {
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destinationParam)}`;
+  }
+
+  const originParam = `${currentPosition[0].toFixed(6)},${currentPosition[1].toFixed(6)}`;
+  return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originParam)}&destination=${encodeURIComponent(destinationParam)}&travelmode=driving`;
+}
+
+function ResponderIncidentFallbackMap({
+  mapCenter,
+  destination,
+  currentPosition,
+  className,
+  isFullscreen,
+}: {
+  mapCenter: LatLng;
+  destination: LatLng;
+  currentPosition: LatLng | null;
+  className: string;
+  isFullscreen: boolean;
+}) {
+  const embedUrl = useMemo(() => buildOpenStreetMapEmbedUrl({
+    mapCenter,
+    destination,
+    currentPosition,
+  }), [mapCenter, destination, currentPosition]);
+  const openStreetMapUrl = useMemo(() => buildOpenStreetMapUrl(destination), [destination]);
+  const googleDirectionsUrl = useMemo(
+    () => buildGoogleDirectionsUrl(destination, currentPosition),
+    [destination, currentPosition]
+  );
+
+  return (
+    <div className={className}>
+      <iframe
+        title="Incident map fallback"
+        src={embedUrl}
+        className="h-full w-full border-0"
+        loading="lazy"
+        referrerPolicy="no-referrer-when-downgrade"
+      />
+
+      <div className="pointer-events-none absolute left-2 top-2 rounded-full border border-white/75 bg-white/92 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-700 shadow-sm">
+        Map Fallback Mode
+      </div>
+
+      <div
+        className={[
+          "absolute left-2 flex flex-wrap gap-2",
+          isFullscreen ? "bottom-20" : "bottom-2",
+        ].join(" ")}
+      >
+        <a
+          href={googleDirectionsUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-full border border-white/75 bg-white/92 px-2.5 py-1 text-[10px] font-semibold text-foreground shadow-sm"
+        >
+          Open Navigation
+        </a>
+        <a
+          href={openStreetMapUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-full border border-white/75 bg-white/92 px-2.5 py-1 text-[10px] font-semibold text-foreground shadow-sm"
+        >
+          Open OSM
+        </a>
+      </div>
+    </div>
+  );
+}
+
 function ResponderIncidentGoogleMap({
   mapCenter,
   currentPosition,
@@ -1647,7 +1774,7 @@ export default function ResponderIncidentDetails() {
             {routeOptions.length > 0 && (
               <div className="space-y-2">
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                  Google route optimization
+                  {hasGoogleMapsKey ? "Google route optimization" : "Fallback route (straight-line)"}
                 </p>
                 <div className="flex gap-2 overflow-x-auto pb-1">
                   {routeOptions.map((route, index) => {
@@ -1687,31 +1814,37 @@ export default function ResponderIncidentDetails() {
           </div>
         )}
 
-        {destination && mapCenter && hasGoogleMapsKey ? (
+        {destination && mapCenter ? (
           <div className="h-72 overflow-hidden rounded-xl border border-white/60 bg-white/65 backdrop-blur-sm">
-            <ResponderIncidentGoogleMap
-              mapCenter={mapCenter}
-              currentPosition={currentPosition}
-              currentHeading={currentHeading}
-              currentSpeedMps={currentSpeedMps}
-              destination={destination}
-              destinationLabel={destinationLabel}
-              routeOptions={routeOptions}
-              selectedRouteId={selectedRouteId}
-              fastestRouteId={fastestRouteId}
-              showRouteDetails={showRouteDetails}
-              zoom={13}
-              isFullscreen={false}
-              onRouteSelect={setSelectedRouteId}
-              focusDestinationToken={focusDestinationToken}
-              responderUnit={responderUnit}
-              className="h-full w-full"
-            />
+            {hasGoogleMapsKey ? (
+              <ResponderIncidentGoogleMap
+                mapCenter={mapCenter}
+                currentPosition={currentPosition}
+                currentHeading={currentHeading}
+                currentSpeedMps={currentSpeedMps}
+                destination={destination}
+                destinationLabel={destinationLabel}
+                routeOptions={routeOptions}
+                selectedRouteId={selectedRouteId}
+                fastestRouteId={fastestRouteId}
+                showRouteDetails={showRouteDetails}
+                zoom={13}
+                isFullscreen={false}
+                onRouteSelect={setSelectedRouteId}
+                focusDestinationToken={focusDestinationToken}
+                responderUnit={responderUnit}
+                className="h-full w-full"
+              />
+            ) : (
+              <ResponderIncidentFallbackMap
+                mapCenter={mapCenter}
+                destination={destination}
+                currentPosition={currentPosition}
+                isFullscreen={false}
+                className="relative h-full w-full"
+              />
+            )}
           </div>
-        ) : destination && mapCenter ? (
-          <p className="text-xs text-muted-foreground">
-            Add VITE_GOOGLE_MAPS_API_KEY to enable live map rendering.
-          </p>
         ) : (
           <p className="text-xs text-muted-foreground">Incident coordinates are unavailable.</p>
         )}
@@ -1724,7 +1857,7 @@ export default function ResponderIncidentDetails() {
 
         {!hasGoogleMapsKey && showRouteDetails && (
           <p className="text-xs text-muted-foreground">
-            Add VITE_GOOGLE_MAPS_API_KEY to enable optimized route alternatives.
+            Google Maps key is missing, so route alternatives use straight-line fallback.
           </p>
         )}
       </div>
@@ -1771,9 +1904,13 @@ export default function ResponderIncidentDetails() {
                 className="absolute inset-0 h-full w-full"
               />
             ) : (
-              <div className="absolute inset-0 flex items-center justify-center bg-slate-950/85 text-sm text-slate-100">
-                Add VITE_GOOGLE_MAPS_API_KEY to show map.
-              </div>
+              <ResponderIncidentFallbackMap
+                mapCenter={mapCenter}
+                destination={destination}
+                currentPosition={currentPosition}
+                isFullscreen={true}
+                className="absolute inset-0 h-full w-full bg-slate-950/20"
+              />
             )}
           </div>
 
