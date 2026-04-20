@@ -9,7 +9,7 @@ import {
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { IncidentReport, IncidentCategory, ReportStatus } from "@/types/incident";
-import { getOfflineSmsReportsByResident, subscribeOfflineSmsReports } from "@/lib/offlineSmsReports";
+import { getPendingOfflineSmsReportsByResident, subscribeOfflineSmsReports } from "@/lib/offlineSmsReports";
 
 function toDate(value: unknown): Date | null {
   if (value instanceof Timestamp) return value.toDate();
@@ -56,7 +56,7 @@ export function useReports() {
     }
 
     const loadOfflineReports = () => {
-      const rows = getOfflineSmsReportsByResident(user.id).map((entry) => ({
+      const rows = getPendingOfflineSmsReportsByResident(user.id).map((entry) => ({
         id: entry.id,
         category: entry.category as IncidentCategory,
         description: entry.description,

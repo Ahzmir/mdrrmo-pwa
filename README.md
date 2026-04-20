@@ -16,3 +16,24 @@ Firebase is initialized in `src/lib/firebase.ts` and loaded from `src/main.tsx`.
 Resident sign-up verification files (ID/proof documents) and incident photos are uploaded to Cloudinary and stored as URLs.
 
 Important: do not put Firebase service-account JSON keys in this frontend project. Service-account credentials must stay on a backend/server only.
+
+## Semaphore SMS Fallback
+
+Offline incident submissions now queue locally and sync through a Firebase callable function (`submitSmsFallbackReport`) that sends via Semaphore.
+
+Set these Cloud Functions environment variables before deploying functions:
+
+- `SEMAPHORE_API_KEY`
+- `SMS_FALLBACK_NUMBER`
+- `SEMAPHORE_SENDERNAME` (optional; defaults to `MDRRMO`)
+
+For local emulation, copy `functions/.env.example` to `functions/.env` and fill the same values.
+
+Example (Firebase CLI):
+
+```bash
+firebase functions:secrets:set SEMAPHORE_API_KEY
+firebase functions:secrets:set SMS_FALLBACK_NUMBER
+```
+
+`SEMAPHORE_SENDERNAME` can be set via `functions/.env` (or runtime env) if you need a custom sender name.

@@ -1,5 +1,8 @@
 {
   "projects": {
-    "default": "sysware-project"
-  }
+    "default": "sysware-project",
+    "mdrrmo": "sysware-project"
+  },
+  "targets": {},
+  "etags": {}
 }

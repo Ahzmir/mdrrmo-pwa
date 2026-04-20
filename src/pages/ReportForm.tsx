@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Flame,
@@ -6,12 +6,10 @@ import {
   ShieldAlert,
   CloudLightning,
   MapPin,
-  MessageSquare,
   Camera,
   Loader2,
   CheckCircle2,
   ArrowLeft,
-  X,
 } from "lucide-react";
 import { IncidentCategory } from "@/types/incident";
 import { cn } from "@/lib/utils";
@@ -30,7 +28,15 @@ import {
 } from "@/components/ui/alert-dialog";
 import { addDoc, collection, doc, getDoc, getDocFromServer, serverTimestamp } from "firebase/firestore";
 import { uploadImageToFirebaseStorage } from "@/lib/storageUpload";
-import { addOfflineSmsReport } from "@/lib/offlineSmsReports";
+import {
+  addOfflineSmsReport,
+  getPendingOfflineSmsReportsByResident,
+  markOfflineSmsReportAttempted,
+  markOfflineSmsReportFailed,
+  markOfflineSmsReportSent,
+  type OfflineSmsReportEntry,
+} from "@/lib/offlineSmsReports";
+import { submitSmsFallbackReport } from "@/lib/semaphoreSmsFallback";
 import { toast } from "sonner";
 
 const categories: { id: IncidentCategory; icon: typeof Flame; label: string; color: string }[] = [
@@ -104,27 +110,12 @@ export default function ReportForm() {
   const [submitted, setSubmitted] = useState(false);
   const [offline, setOffline] = useState(!navigator.onLine);
   const [forceOfflineMode, setForceOfflineMode] = useState(false);
-  const [smsPreviewOpen, setSmsPreviewOpen] = useState(false);
-  const [smsDraft, setSmsDraft] = useState("");
   const [submitConfirmOpen, setSubmitConfirmOpen] = useState(false);
   const firebaseProjectId = (import.meta.env.VITE_FIREBASE_PROJECT_ID as string | undefined) || "(missing-project-id)";
 
   const effectiveOffline = offline || forceOfflineMode;
 
   const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "+16624902852";
-
-  useEffect(() => {
-    const handleOnline = () => setOffline(false);
-    const handleOffline = () => setOffline(true);
-
-    window.addEventListener("online", handleOnline);
-    window.addEventListener("offline", handleOffline);
-
-    return () => {
-      window.removeEventListener("online", handleOnline);
-      window.removeEventListener("offline", handleOffline);
-    };
-  }, []);
 
   function categoryToSmsLabel(value: IncidentCategory) {
     if (value === "fire") return "FIRE";
@@ -165,22 +156,12 @@ export default function ReportForm() {
     window.location.href = smsUri;
   }
 
-  function openSmsFallbackPreview() {
-    const message = buildSmsFallbackMessage();
-    if (!message) {
-      return;
-    }
-
-    setSmsDraft(message);
-    setSmsPreviewOpen(true);
-  }
-
-  function saveOfflineSmsHistory(message: string) {
+  function queueOfflineSmsHistory(message: string) {
     if (!user || user.role !== "resident" || !category || !coordinates) {
-      return;
+      return null;
     }
 
-    addOfflineSmsReport({
+    const entry: OfflineSmsReportEntry = {
       id: `offline-sms-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       residentId: user.id,
       category,
@@ -190,8 +171,88 @@ export default function ReportForm() {
       createdAtIso: new Date().toISOString(),
       smsNumber: smsFallbackNumber,
       smsBody: message,
-    });
+      deliveryStatus: "queued",
+      lastAttemptAtIso: null,
+      sentAtIso: null,
+      failureReason: null,
+      semaphoreMessageId: null,
+    };
+
+    addOfflineSmsReport(entry);
+    return entry;
   }
+
+  const syncOfflineSmsEntry = useCallback(async (entry: OfflineSmsReportEntry) => {
+    if (!user || user.role !== "resident") {
+      return false;
+    }
+
+    markOfflineSmsReportAttempted(entry.id);
+
+    try {
+      const result = await submitSmsFallbackReport({
+        reportId: entry.id,
+        smsBody: entry.smsBody,
+        category: entry.category,
+        description: entry.description,
+        location: entry.location,
+        coordinates: entry.coordinates,
+        createdAtIso: entry.createdAtIso,
+        reporterName: user.name,
+        reporterPhone: residentPhone,
+        reporterEmail: user.email,
+      });
+
+      markOfflineSmsReportSent(entry.id, result.semaphoreMessageIds[0] || null);
+      return true;
+    } catch (error) {
+      const message =
+        (error as { message?: string })?.message ||
+        "Unable to sync SMS fallback with Semaphore.";
+      markOfflineSmsReportFailed(entry.id, message);
+      return false;
+    }
+  }, [residentPhone, user]);
+
+  const syncPendingOfflineSmsReports = useCallback(async () => {
+    if (!user || user.role !== "resident" || !navigator.onLine) {
+      return;
+    }
+
+    const pendingEntries = getPendingOfflineSmsReportsByResident(user.id);
+    if (pendingEntries.length === 0) {
+      return;
+    }
+
+    for (const entry of pendingEntries) {
+      // Send sequentially to avoid tripping SMS provider rate limits.
+      await syncOfflineSmsEntry(entry);
+    }
+  }, [syncOfflineSmsEntry, user]);
+
+  useEffect(() => {
+    const handleOnline = () => {
+      setOffline(false);
+      void syncPendingOfflineSmsReports();
+    };
+    const handleOffline = () => setOffline(true);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, [syncPendingOfflineSmsReports]);
+
+  useEffect(() => {
+    if (!user || user.role !== "resident" || !navigator.onLine) {
+      return;
+    }
+
+    void syncPendingOfflineSmsReports();
+  }, [syncPendingOfflineSmsReports, user]);
 
   useEffect(() => {
     let mounted = true;
@@ -253,8 +314,9 @@ export default function ReportForm() {
           );
         }
       } finally {
-        if (!mounted) return;
-        setVerificationChecked(true);
+        if (mounted) {
+          setVerificationChecked(true);
+        }
       }
     }
 
@@ -531,8 +593,30 @@ export default function ReportForm() {
         return;
       }
 
-      saveOfflineSmsHistory(smsMessage);
-      launchSmsFallback(smsMessage);
+      const queuedEntry = queueOfflineSmsHistory(smsMessage);
+      if (!queuedEntry) {
+        setSubmitError("Unable to queue SMS fallback report right now.");
+        return;
+      }
+
+      if (!navigator.onLine) {
+        toast.info("No internet connection. Opening your SMS app now. Tap Send to submit.");
+        launchSmsFallback(smsMessage);
+        // Avoid duplicate delivery when connectivity returns by marking this
+        // entry as completed after handing off to the device SMS app.
+        markOfflineSmsReportSent(queuedEntry.id, "device-sms");
+        setSubmitted(true);
+        return;
+      }
+
+      const sentViaSemaphore = await syncOfflineSmsEntry(queuedEntry);
+      if (sentViaSemaphore) {
+        toast.success("Report sent via Semaphore SMS fallback.");
+      } else {
+        toast.warning("Semaphore send failed. Opening your SMS app as backup.");
+        launchSmsFallback(smsMessage);
+      }
+
       setSubmitted(true);
       return;
     }
@@ -946,7 +1030,7 @@ export default function ReportForm() {
       {effectiveOffline && (
         <div className="mb-3 rounded-xl border-2 border-dashed border-warning bg-warning-light px-3 py-2">
           <p className="text-xs font-semibold text-warning-foreground">
-            You are offline. Submit will open SMS with a formatted incident report to send to {smsFallbackNumber}.
+            SMS fallback mode is active. If internet is offline, your SMS app opens so you can send immediately to {smsFallbackNumber}. If online, this sends via Semaphore.
           </p>
         </div>
       )}
@@ -987,7 +1071,7 @@ export default function ReportForm() {
             Submitting report...
           </span>
         ) : (
-          effectiveOffline ? "Send via SMS" : "Submit Report"
+          effectiveOffline ? "Send via SMS Fallback" : "Submit Report"
         )}
       </button>
       {submitError && <p className="mt-2 text-xs text-destructive">{submitError}</p>}
@@ -996,11 +1080,11 @@ export default function ReportForm() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {effectiveOffline ? "Send SMS report now?" : "Submit incident report now?"}
+              {effectiveOffline ? "Send SMS fallback report now?" : "Submit incident report now?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {effectiveOffline
-                ? "This will open your SMS app with the formatted incident details, including your pinned location."
+                ? "If online, this sends through Semaphore now. If offline, your SMS app opens so you can send immediately."
                 : "Please confirm the report details are correct before sending to MDRRMO."}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -1012,59 +1096,12 @@ export default function ReportForm() {
                 void handleSubmit();
               }}
             >
-              {effectiveOffline ? "Send via SMS" : "Submit Report"}
+              {effectiveOffline ? "Send via SMS Fallback" : "Submit Report"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
-      {smsPreviewOpen && (
-        <div className="fixed inset-0 z-[120] bg-foreground/40 backdrop-blur-sm px-4 py-6">
-          <div className="mx-auto max-w-lg rounded-2xl border border-white/55 bg-white/90 p-4 shadow-2xl backdrop-blur-xl">
-            <div className="mb-3 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <MessageSquare size={18} className="text-warning" />
-                <h3 className="text-sm font-bold text-foreground">SMS Fallback Preview</h3>
-              </div>
-              <button
-                onClick={() => setSmsPreviewOpen(false)}
-                className="rounded-md p-1 text-muted-foreground hover:bg-white/70"
-              >
-                <X size={16} />
-              </button>
-            </div>
-
-            <p className="mb-2 text-xs text-muted-foreground">
-              This message will be sent to {smsFallbackNumber}. You can edit it before opening your SMS app.
-            </p>
-
-            <textarea
-              value={smsDraft}
-              onChange={(event) => setSmsDraft(event.target.value)}
-              rows={10}
-              className="w-full rounded-xl border border-white/60 bg-white/70 px-3 py-2 text-xs font-mono text-foreground outline-none focus:ring-2 focus:ring-warning/35"
-            />
-
-            <div className="mt-3 flex gap-2">
-              <button
-                onClick={() => setSmsPreviewOpen(false)}
-                className="flex-1 rounded-xl border border-border py-2 text-sm font-semibold text-foreground"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  setSmsPreviewOpen(false);
-                  launchSmsFallback(smsDraft);
-                }}
-                className="flex-1 rounded-xl bg-orange-600 py-2 text-sm font-semibold text-white"
-              >
-                Open SMS App
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

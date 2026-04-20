@@ -2,6 +2,7 @@ import { initializeApp } from "firebase/app";
 import { getAnalytics, isSupported, type Analytics } from "firebase/analytics";
 import { getAuth } from "firebase/auth";
 import { getFirestore, initializeFirestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
 import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
@@ -48,6 +49,13 @@ export const db = (() => {
   }
 })();
 export const storage = getStorage(firebaseApp);
+export const functions = (() => {
+  const configuredRegion = import.meta.env.VITE_FIREBASE_FUNCTIONS_REGION;
+  if (configuredRegion && typeof configuredRegion === "string" && configuredRegion.trim()) {
+    return getFunctions(firebaseApp, configuredRegion.trim());
+  }
+  return getFunctions(firebaseApp);
+})();
 
 export let analytics: Analytics | null = null;
 

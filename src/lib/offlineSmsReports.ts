@@ -3,6 +3,8 @@ import type { IncidentCategory } from "@/types/incident";
 export const OFFLINE_SMS_REPORTS_KEY = "mdrrmo_offline_sms_reports_v1";
 const OFFLINE_SMS_REPORTS_EVENT = "mdrrmo:offline-sms-reports-updated";
 
+export type OfflineSmsDeliveryStatus = "queued" | "sent" | "failed";
+
 export interface OfflineSmsReportEntry {
   id: string;
   residentId: string;
@@ -13,6 +15,18 @@ export interface OfflineSmsReportEntry {
   createdAtIso: string;
   smsNumber: string;
   smsBody: string;
+  deliveryStatus: OfflineSmsDeliveryStatus;
+  lastAttemptAtIso: string | null;
+  sentAtIso: string | null;
+  failureReason: string | null;
+  semaphoreMessageId: string | null;
+}
+
+function normalizeDeliveryStatus(value: unknown): OfflineSmsDeliveryStatus {
+  if (value === "queued" || value === "sent" || value === "failed") {
+    return value;
+  }
+  return "queued";
 }
 
 function isValidEntry(value: unknown): value is OfflineSmsReportEntry {
@@ -34,7 +48,12 @@ function isValidEntry(value: unknown): value is OfflineSmsReportEntry {
     Number.isFinite((row.coordinates as { lng?: number }).lng) &&
     typeof row.createdAtIso === "string" &&
     typeof row.smsNumber === "string" &&
-    typeof row.smsBody === "string"
+    typeof row.smsBody === "string" &&
+    (row.deliveryStatus === undefined || row.deliveryStatus === "queued" || row.deliveryStatus === "sent" || row.deliveryStatus === "failed") &&
+    (row.lastAttemptAtIso === undefined || row.lastAttemptAtIso === null || typeof row.lastAttemptAtIso === "string") &&
+    (row.sentAtIso === undefined || row.sentAtIso === null || typeof row.sentAtIso === "string") &&
+    (row.failureReason === undefined || row.failureReason === null || typeof row.failureReason === "string") &&
+    (row.semaphoreMessageId === undefined || row.semaphoreMessageId === null || typeof row.semaphoreMessageId === "string")
   );
 }
 
@@ -54,7 +73,16 @@ function readAll(): OfflineSmsReportEntry[] {
       return [];
     }
 
-    return parsed.filter(isValidEntry);
+    return parsed
+      .filter(isValidEntry)
+      .map((entry) => ({
+        ...entry,
+        deliveryStatus: normalizeDeliveryStatus(entry.deliveryStatus),
+        lastAttemptAtIso: entry.lastAttemptAtIso ?? null,
+        sentAtIso: entry.sentAtIso ?? null,
+        failureReason: entry.failureReason ?? null,
+        semaphoreMessageId: entry.semaphoreMessageId ?? null,
+      }));
   } catch {
     return [];
   }
@@ -71,11 +99,67 @@ function writeAll(rows: OfflineSmsReportEntry[]) {
 
 export function addOfflineSmsReport(entry: OfflineSmsReportEntry) {
   const existing = readAll();
-  writeAll([entry, ...existing]);
+  writeAll([
+    {
+      ...entry,
+      deliveryStatus: normalizeDeliveryStatus(entry.deliveryStatus),
+      lastAttemptAtIso: entry.lastAttemptAtIso ?? null,
+      sentAtIso: entry.sentAtIso ?? null,
+      failureReason: entry.failureReason ?? null,
+      semaphoreMessageId: entry.semaphoreMessageId ?? null,
+    },
+    ...existing,
+  ]);
 }
 
 export function getOfflineSmsReportsByResident(residentId: string) {
   return readAll().filter((row) => row.residentId === residentId);
+}
+
+export function getPendingOfflineSmsReportsByResident(residentId: string) {
+  return readAll().filter(
+    (row) => row.residentId === residentId && row.deliveryStatus !== "sent"
+  );
+}
+
+function updateOfflineSmsReport(
+  id: string,
+  updater: (entry: OfflineSmsReportEntry) => OfflineSmsReportEntry
+) {
+  const existing = readAll();
+  const next = existing.map((entry) => (entry.id === id ? updater(entry) : entry));
+  writeAll(next);
+}
+
+export function markOfflineSmsReportAttempted(id: string) {
+  const attemptTimeIso = new Date().toISOString();
+  updateOfflineSmsReport(id, (entry) => ({
+    ...entry,
+    lastAttemptAtIso: attemptTimeIso,
+    failureReason: null,
+  }));
+}
+
+export function markOfflineSmsReportSent(id: string, semaphoreMessageId?: string | null) {
+  const sentAtIso = new Date().toISOString();
+  updateOfflineSmsReport(id, (entry) => ({
+    ...entry,
+    deliveryStatus: "sent",
+    sentAtIso,
+    lastAttemptAtIso: sentAtIso,
+    failureReason: null,
+    semaphoreMessageId: semaphoreMessageId ?? entry.semaphoreMessageId ?? null,
+  }));
+}
+
+export function markOfflineSmsReportFailed(id: string, reason?: string) {
+  const failedAtIso = new Date().toISOString();
+  updateOfflineSmsReport(id, (entry) => ({
+    ...entry,
+    deliveryStatus: "failed",
+    lastAttemptAtIso: failedAtIso,
+    failureReason: reason?.trim() || "Semaphore sync failed.",
+  }));
 }
 
 export function subscribeOfflineSmsReports(onChange: () => void) {
