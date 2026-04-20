@@ -15,7 +15,7 @@ import {
   setDoc,
   updateDoc,
 } from "firebase/firestore";
-import { auth, db } from "@/lib/firebase";
+import { auth, db, ensureAuthPersistence } from "@/lib/firebase";
 
 export type UserRole = "resident" | "responder";
 export type ResponderUnit = "police" | "medic" | "disaster";
@@ -357,51 +357,61 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let active = true;
+    let unsubscribe: (() => void) | null = null;
 
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+    const initializeAuthListener = async () => {
+      await ensureAuthPersistence();
       if (!active) return;
 
-      if (!firebaseUser) {
-        setUser(null);
-        setLoading(false);
-        return;
-      }
-
-      try {
-        const responderProfile = await getResponderProfile(firebaseUser.uid);
+      unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
         if (!active) return;
 
-        if (responderProfile?.role === "responder") {
-          setUser(toResponderUser(firebaseUser.uid, responderProfile, firebaseUser.email));
-          return;
-        }
-
-        const residentProfile = await getResidentProfile(firebaseUser.uid);
-        if (!active) return;
-
-        if (!residentProfile) {
+        if (!firebaseUser) {
           setUser(null);
+          setLoading(false);
           return;
         }
 
-        if (isRejectedResident(residentProfile)) {
-          await forceRejectedResidentSignOut(residentProfile.rejectionReason);
-          return;
-        }
+        try {
+          const responderProfile = await getResponderProfile(firebaseUser.uid);
+          if (!active) return;
 
-        setUser(toResidentUser(firebaseUser.uid, residentProfile, firebaseUser.email));
-      } catch {
-        if (!active) return;
-        setUser(null);
-      } finally {
-        if (!active) return;
-        setLoading(false);
-      }
-    });
+          if (responderProfile?.role === "responder") {
+            setUser(toResponderUser(firebaseUser.uid, responderProfile, firebaseUser.email));
+            return;
+          }
+
+          const residentProfile = await getResidentProfile(firebaseUser.uid);
+          if (!active) return;
+
+          if (!residentProfile) {
+            setUser(null);
+            return;
+          }
+
+          if (isRejectedResident(residentProfile)) {
+            await forceRejectedResidentSignOut(residentProfile.rejectionReason);
+            return;
+          }
+
+          setUser(toResidentUser(firebaseUser.uid, residentProfile, firebaseUser.email));
+        } catch {
+          if (!active) return;
+          setUser(null);
+        } finally {
+          if (!active) return;
+          setLoading(false);
+        }
+      });
+    };
+
+    void initializeAuthListener();
 
     return () => {
       active = false;
-      unsubscribe();
+      if (unsubscribe) {
+        unsubscribe();
+      }
     };
   }, [forceRejectedResidentSignOut]);
 
@@ -720,6 +730,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setLoading(true);
 
     try {
+      await ensureAuthPersistence();
       const normalizedEmail = email.trim().toLowerCase();
       if (!normalizedEmail || !password) {
         throw new Error("Email and password are required.");
@@ -785,6 +796,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setLoading(true);
 
     try {
+      await ensureAuthPersistence();
       const municipality = "Banisilan";
       const normalizedEmail = data.email.trim().toLowerCase();
       const fullName = data.fullName.trim();

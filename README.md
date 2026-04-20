@@ -26,6 +26,7 @@ Set these Cloud Functions environment variables before deploying functions:
 - `SEMAPHORE_API_KEY`
 - `SMS_FALLBACK_NUMBER`
 - `SEMAPHORE_SENDERNAME` (optional; defaults to `MDRRMO`)
+- `SIM_INBOUND_TOKEN` (required for SIM-bridge inbound webhook auth)
 
 For local emulation, copy `functions/.env.example` to `functions/.env` and fill the same values.
 
@@ -34,6 +35,23 @@ Example (Firebase CLI):
 ```bash
 firebase functions:secrets:set SEMAPHORE_API_KEY
 firebase functions:secrets:set SMS_FALLBACK_NUMBER
+firebase functions:secrets:set SIM_INBOUND_TOKEN
 ```
 
 `SEMAPHORE_SENDERNAME` can be set via `functions/.env` (or runtime env) if you need a custom sender name.
+
+## SIM Bridge Inbound SMS
+
+If hotline SMS is received on a regular SIM, use the `simInboundSms` HTTPS function as the bridge target:
+
+`https://us-central1-<your-project-id>.cloudfunctions.net/simInboundSms`
+
+Required auth:
+- Header `x-bridge-token: <SIM_INBOUND_TOKEN>` (or `Authorization: Bearer <SIM_INBOUND_TOKEN>`)
+
+Accepted payload fields:
+- Sender: `from`, `From`, `sender`, or `number`
+- Message body: `body`, `Body`, `message`, or `text`
+- Optional metadata: `messageId`/`smsId`, `receivedAt`/`timestamp`
+
+When accepted, the function writes to `incoming_sms` and `smsInbox`, so admin SMS view and incident auto-conversion continue to work.

@@ -1,13 +1,16 @@
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
+const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { defineSecret } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
+const crypto = require("node:crypto");
 const admin = require("firebase-admin");
 
 const SEMAPHORE_MESSAGES_ENDPOINT = "https://api.semaphore.co/api/v4/messages";
 const DEFAULT_SEMAPHORE_SENDERNAME = "MDRRMO";
 const semaphoreApiKeySecret = defineSecret("SEMAPHORE_API_KEY");
 const smsFallbackNumberSecret = defineSecret("SMS_FALLBACK_NUMBER");
+const simInboundTokenSecret = defineSecret("SIM_INBOUND_TOKEN");
 
 admin.initializeApp();
 setGlobalOptions({ maxInstances: 10 });
@@ -50,10 +53,323 @@ async function storeInboundSms({ sender, message, source, extra = {} }) {
     ...extra,
   };
 
+  const smsId = db.collection("incoming_sms").doc().id;
+  const incomingRef = db.collection("incoming_sms").doc(smsId);
+  const smsInboxRef = db.collection("smsInbox").doc(smsId);
+
   await Promise.all([
-    db.collection("incoming_sms").add(basePayload),
-    db.collection("smsInbox").add(basePayload),
+    incomingRef.set(basePayload),
+    smsInboxRef.set(basePayload),
   ]);
+
+  return {
+    smsId,
+    incomingRef,
+    smsInboxRef,
+  };
+}
+
+function toTrimmedString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function safeTokenEquals(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+
+  const leftBuffer = Buffer.from(left, "utf8");
+  const rightBuffer = Buffer.from(right, "utf8");
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function extractBearerToken(headerValue) {
+  if (typeof headerValue !== "string") {
+    return "";
+  }
+
+  const match = headerValue.match(/^Bearer\s+(.+)$/i);
+  return match && typeof match[1] === "string" ? match[1].trim() : "";
+}
+
+function extractInboundBridgeToken(req, payload) {
+  const headerToken =
+    toTrimmedString(req.get("x-bridge-token")) ||
+    toTrimmedString(req.get("x-webhook-token")) ||
+    toTrimmedString(req.get("x-api-key"));
+
+  if (headerToken) {
+    return headerToken;
+  }
+
+  const bearerToken = extractBearerToken(req.get("authorization"));
+  if (bearerToken) {
+    return bearerToken;
+  }
+
+  return (
+    toTrimmedString(payload?.token) ||
+    toTrimmedString(payload?.apiKey) ||
+    toTrimmedString(payload?.secret)
+  );
+}
+
+function toDateValue(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value;
+  }
+
+  if (value && typeof value === "object" && typeof value.toDate === "function") {
+    try {
+      const dateValue = value.toDate();
+      if (dateValue instanceof Date && !Number.isNaN(dateValue.getTime())) {
+        return dateValue;
+      }
+    } catch {
+      // Ignore invalid timestamp-like objects.
+    }
+  }
+
+  if (typeof value === "string") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function extractLabeledSmsValue(message, label) {
+  const matcher = new RegExp(`^${label}\\s*:\\s*(.+)$`, "im");
+  const match = message.match(matcher);
+  if (!match || typeof match[1] !== "string") {
+    return null;
+  }
+
+  const value = match[1].trim();
+  return value.length > 0 ? value : null;
+}
+
+function normalizeIncidentCategory(value) {
+  const normalized = toTrimmedString(value).toLowerCase();
+  if (normalized === "fire") return "fire";
+  if (normalized === "medical") return "medical";
+  if (normalized === "crime" || normalized === "police") return "crime";
+  if (normalized === "disaster") return "disaster";
+  return null;
+}
+
+function inferIncidentCategoryFromSmsMessage(message) {
+  const content = message.toLowerCase();
+  if (content.includes("sunog") || content.includes("fire")) return "fire";
+  if (
+    content.includes("baha") ||
+    content.includes("flood") ||
+    content.includes("landslide") ||
+    content.includes("bagyo") ||
+    content.includes("storm")
+  ) {
+    return "disaster";
+  }
+  if (
+    content.includes("injured") ||
+    content.includes("sugat") ||
+    content.includes("nahimatay") ||
+    content.includes("collapsed") ||
+    content.includes("medical")
+  ) {
+    return "medical";
+  }
+  return "crime";
+}
+
+function inferIncidentPriorityFromSmsMessage(message, category) {
+  const content = message.toLowerCase();
+  if (
+    content.includes("critical") ||
+    content.includes("urgent") ||
+    content.includes("malaki") ||
+    content.includes("malala") ||
+    content.includes("major") ||
+    content.includes("multiple")
+  ) {
+    return "Critical";
+  }
+
+  if (
+    content.includes("help") ||
+    content.includes("tulong") ||
+    content.includes("emergency") ||
+    content.includes("aksidente") ||
+    content.includes("accident")
+  ) {
+    return "High";
+  }
+
+  if (category === "fire" || category === "medical") {
+    return "Critical";
+  }
+
+  if (category === "crime" || category === "disaster") {
+    return "High";
+  }
+
+  return "Low";
+}
+
+function parseCoordinatesFromSmsMessage(message) {
+  const coordsLine = extractLabeledSmsValue(message, "COORDS");
+  if (!coordsLine) {
+    return null;
+  }
+
+  const match = coordsLine.match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/);
+  if (!match) {
+    return null;
+  }
+
+  const lat = Number(match[1]);
+  const lng = Number(match[2]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return null;
+  }
+
+  return { lat, lng };
+}
+
+function normalizeCoordinates(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const latRaw = value.lat;
+  const lngRaw = value.lng;
+  const lat = typeof latRaw === "number" ? latRaw : Number(latRaw);
+  const lng = typeof lngRaw === "number" ? lngRaw : Number(lngRaw);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return null;
+  }
+
+  return { lat, lng };
+}
+
+function categoryLabel(category) {
+  if (category === "fire") return "Fire";
+  if (category === "medical") return "Medical";
+  if (category === "crime") return "Crime";
+  return "Disaster";
+}
+
+function buildIncidentTitleFromSms(category, message) {
+  const label = categoryLabel(category);
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return `${label} Incident via SMS`;
+  }
+
+  const snippet = trimmed.length > 64 ? `${trimmed.slice(0, 61)}...` : trimmed;
+  return `${label}: ${snippet}`;
+}
+
+function buildIncidentFromInboundSms({ smsId, data }) {
+  const sender =
+    toTrimmedString(data.sender) ||
+    toTrimmedString(data.phone) ||
+    toTrimmedString(data.from) ||
+    "Unknown Sender";
+  const message =
+    toTrimmedString(data.message) ||
+    toTrimmedString(data.body) ||
+    toTrimmedString(data.text) ||
+    "No SMS body received.";
+
+  const labeledCategory = normalizeIncidentCategory(extractLabeledSmsValue(message, "CATEGORY"));
+  const category =
+    normalizeIncidentCategory(data.category) ||
+    labeledCategory ||
+    inferIncidentCategoryFromSmsMessage(message);
+  const priority = inferIncidentPriorityFromSmsMessage(message, category);
+  const location =
+    toTrimmedString(data.location) ||
+    extractLabeledSmsValue(message, "LOCATION") ||
+    "Reported via SMS";
+  const coordinates =
+    normalizeCoordinates(data.coordinates) ||
+    parseCoordinatesFromSmsMessage(message);
+  const description =
+    toTrimmedString(data.description) ||
+    extractLabeledSmsValue(message, "DESCRIPTION") ||
+    message;
+
+  const residentName =
+    toTrimmedString(data.residentName) ||
+    toTrimmedString(data.reporterName) ||
+    sender ||
+    "SMS Reporter";
+  const residentEmailRaw =
+    toTrimmedString(data.residentEmail) ||
+    toTrimmedString(data.reporterEmail);
+  const residentEmail = residentEmailRaw
+    ? residentEmailRaw.toLowerCase()
+    : (sender.includes("@") ? sender.toLowerCase() : "");
+  const residentPhone =
+    toTrimmedString(data.residentPhone) ||
+    toTrimmedString(data.reporterPhone) ||
+    (!sender.includes("@") ? sender : "");
+
+  const reportId = toTrimmedString(data.reportId);
+  const residentUid =
+    toTrimmedString(data.residentUid) ||
+    toTrimmedString(data.residentId) ||
+    (reportId ? `sms:${reportId}` : `sms:${smsId}`);
+
+  const reportedAt =
+    toDateValue(data.originalCreatedAtIso) ||
+    toDateValue(data.createdAtIso) ||
+    toDateValue(data.receivedAt) ||
+    toDateValue(data.createdAt) ||
+    new Date();
+
+  return {
+    title: buildIncidentTitleFromSms(category, message),
+    category,
+    description,
+    location,
+    barangay: toTrimmedString(data.barangay) || "Unknown",
+    priority,
+    status: "pending",
+    source: "SMS",
+    lat: coordinates ? coordinates.lat : 0,
+    lng: coordinates ? coordinates.lng : 0,
+    assignedResponders: [],
+    residentId: residentUid,
+    residentName,
+    residentEmail,
+    residentPhone,
+    photoUrl: null,
+    reportedAt: admin.firestore.Timestamp.fromDate(reportedAt),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    smsReportId: smsId,
+    smsSourceCollection: "incoming_sms",
+    smsSender: sender,
+    smsProvider: toTrimmedString(data.provider) || null,
+    smsOriginalReportId: reportId || null,
+  };
 }
 
 function parseSmsFallbackPayload(data) {
@@ -189,6 +505,29 @@ function readSemaphoreConfig() {
     destination,
     senderName: senderNameRaw || DEFAULT_SEMAPHORE_SENDERNAME,
   };
+}
+
+function readSimInboundToken() {
+  let token = "";
+
+  try {
+    const secretValue = simInboundTokenSecret.value();
+    if (typeof secretValue === "string") {
+      token = secretValue.trim();
+    }
+  } catch {
+    token = "";
+  }
+
+  if (!token && typeof process.env.SIM_INBOUND_TOKEN === "string") {
+    token = process.env.SIM_INBOUND_TOKEN.trim();
+  }
+
+  if (!token) {
+    throw new Error("SIM_INBOUND_TOKEN is not configured in Cloud Functions.");
+  }
+
+  return token;
 }
 
 async function sendSmsSemaphore({ apiKey, destination, message, senderName }) {
@@ -496,6 +835,39 @@ exports.submitSmsFallbackReport = onCall({
   }
 });
 
+exports.convertIncomingSmsToIncident = onDocumentCreated("incoming_sms/{smsId}", async (event) => {
+  const smsId = event.params?.smsId;
+  const snapshot = event.data;
+  if (!snapshot || !smsId) {
+    return;
+  }
+
+  const data = snapshot.data() || {};
+  const existingIncidentId = toTrimmedString(data.incidentId);
+  if (data.converted === true && existingIncidentId) {
+    return;
+  }
+
+  const incidentRef = db.collection("incidents").doc(`sms-${smsId}`);
+  const incidentSnap = await incidentRef.get();
+  if (!incidentSnap.exists) {
+    const incidentPayload = buildIncidentFromInboundSms({ smsId, data });
+    await incidentRef.set(incidentPayload);
+  }
+
+  const conversionPayload = {
+    converted: true,
+    convertedAt: admin.firestore.FieldValue.serverTimestamp(),
+    incidentId: incidentRef.id,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  await Promise.all([
+    snapshot.ref.set(conversionPayload, { merge: true }),
+    db.collection("smsInbox").doc(smsId).update(conversionPayload).catch(() => undefined),
+  ]);
+});
+
 exports.twilioInboundSms = onRequest(async (req, res) => {
   if (req.method !== "POST") {
     res.status(405).send("Method Not Allowed");
@@ -558,6 +930,65 @@ exports.semaphoreInboundSms = onRequest(async (req, res) => {
     res.status(200).json({ ok: true });
   } catch (error) {
     logger.error("Failed to process Semaphore inbound SMS", {
+      message: error?.message,
+    });
+    res.status(500).json({ ok: false });
+  }
+});
+
+exports.simInboundSms = onRequest({
+  secrets: [simInboundTokenSecret],
+}, async (req, res) => {
+  if (req.method !== "POST") {
+    res.status(405).send("Method Not Allowed");
+    return;
+  }
+
+  try {
+    let payload = req.body;
+    if (!payload || typeof payload !== "object") {
+      const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody.toString("utf8") : "";
+      payload = Object.fromEntries(new URLSearchParams(raw));
+    }
+
+    const expectedToken = readSimInboundToken();
+    const providedToken = extractInboundBridgeToken(req, payload);
+    if (!safeTokenEquals(providedToken, expectedToken)) {
+      logger.warn("Rejected SIM bridge inbound SMS due to invalid token", {
+        senderHint:
+          (typeof payload?.From === "string" && payload.From.trim()) ||
+          (typeof payload?.from === "string" && payload.from.trim()) ||
+          (typeof payload?.sender === "string" && payload.sender.trim()) ||
+          null,
+      });
+      res.status(401).json({ ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    const { sender, message } = parseInboundSmsPayload(payload);
+
+    await storeInboundSms({
+      sender,
+      message,
+      source: "sim-bridge",
+      extra: {
+        provider: "sim-bridge",
+        bridgeMessageId:
+          toTrimmedString(payload?.messageId) ||
+          toTrimmedString(payload?.smsId) ||
+          toTrimmedString(payload?.id) ||
+          null,
+        bridgeReceivedAt:
+          toTrimmedString(payload?.receivedAt) ||
+          toTrimmedString(payload?.timestamp) ||
+          toTrimmedString(payload?.date) ||
+          null,
+      },
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    logger.error("Failed to process SIM bridge inbound SMS", {
       message: error?.message,
     });
     res.status(500).json({ ok: false });

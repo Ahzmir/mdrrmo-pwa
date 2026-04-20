@@ -1,6 +1,11 @@
 import { initializeApp } from "firebase/app";
 import { getAnalytics, isSupported, type Analytics } from "firebase/analytics";
-import { getAuth } from "firebase/auth";
+import {
+  browserLocalPersistence,
+  getAuth,
+  indexedDBLocalPersistence,
+  setPersistence,
+} from "firebase/auth";
 import { getFirestore, initializeFirestore } from "firebase/firestore";
 import { getFunctions } from "firebase/functions";
 import { getStorage } from "firebase/storage";
@@ -35,6 +40,23 @@ if (missingConfig.length > 0) {
 
 export const firebaseApp = initializeApp(firebaseConfig);
 export const auth = getAuth(firebaseApp);
+let authPersistenceReady: Promise<void> | null = null;
+
+export function ensureAuthPersistence() {
+  if (typeof window === "undefined") {
+    return Promise.resolve();
+  }
+
+  if (!authPersistenceReady) {
+    authPersistenceReady = setPersistence(auth, indexedDBLocalPersistence)
+      .catch(() => setPersistence(auth, browserLocalPersistence))
+      .catch(() => undefined);
+  }
+
+  return authPersistenceReady;
+}
+
+void ensureAuthPersistence();
 export const db = (() => {
   if (typeof window === "undefined") {
     return getFirestore(firebaseApp);
