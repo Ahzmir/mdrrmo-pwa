@@ -115,7 +115,7 @@ export default function ReportForm() {
 
   const effectiveOffline = offline || forceOfflineMode;
 
-  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "+16624902852";
+  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "09067807028";
 
   function categoryToSmsLabel(value: IncidentCategory) {
     if (value === "fire") return "FIRE";
@@ -600,11 +600,9 @@ export default function ReportForm() {
       }
 
       if (!navigator.onLine) {
-        toast.info("No internet connection. Opening your SMS app now. Tap Send to submit.");
+        toast.info("No internet connection. Opening SMS app now. If you have no load, this report stays queued and will auto-send via internet later.");
         launchSmsFallback(smsMessage);
-        // Avoid duplicate delivery when connectivity returns by marking this
-        // entry as completed after handing off to the device SMS app.
-        markOfflineSmsReportSent(queuedEntry.id, "device-sms");
+        markOfflineSmsReportAttempted(queuedEntry.id);
         setSubmitted(true);
         return;
       }
@@ -1030,7 +1028,7 @@ export default function ReportForm() {
       {effectiveOffline && (
         <div className="mb-3 rounded-xl border-2 border-dashed border-warning bg-warning-light px-3 py-2">
           <p className="text-xs font-semibold text-warning-foreground">
-            SMS fallback mode is active. If internet is offline, your SMS app opens so you can send immediately to {smsFallbackNumber}. If online, this sends via Semaphore.
+            SMS fallback mode is active. If internet is offline, your SMS app opens for immediate send to {smsFallbackNumber}. If SMS cannot send (e.g., no load), this report stays queued and auto-syncs via Semaphore once internet is back.
           </p>
         </div>
       )}
@@ -1084,7 +1082,7 @@ export default function ReportForm() {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {effectiveOffline
-                ? "If online, this sends through Semaphore now. If offline, your SMS app opens so you can send immediately."
+                ? "If online, this sends through Semaphore now. If offline, your SMS app opens for immediate send. If SMS fails (like no load), the report remains queued for auto-sync once internet returns."
                 : "Please confirm the report details are correct before sending to MDRRMO."}
             </AlertDialogDescription>
           </AlertDialogHeader>
