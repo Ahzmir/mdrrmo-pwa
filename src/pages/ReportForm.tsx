@@ -136,6 +136,26 @@ export default function ReportForm() {
       .trim();
   }
 
+  function canonicalizeSmsFallbackMessage(value: string) {
+    let normalized = normalizeOneLine(value).replace(/;/g, " ");
+
+    normalized = normalized.replace(
+      /\s+(CATEGORY:|LOCATION:|COORDS:|DESCRIPTION:|REPORTER:|TIME:)\s*/gi,
+      "; $1 "
+    );
+
+    normalized = normalized.replace(
+      /^\s*MDRRMO INCIDENT REPORT\s*/i,
+      "MDRRMO INCIDENT REPORT; "
+    );
+
+    return normalized
+      .replace(/;\s*;/g, "; ")
+      .replace(/\s+/g, " ")
+      .replace(/\s*;\s*/g, "; ")
+      .trim();
+  }
+
   function buildSmsFallbackMessage() {
     if (!category || !location || !coordinates) {
       const missing: string[] = [];
@@ -164,7 +184,7 @@ export default function ReportForm() {
 
   function launchSmsFallback(message: string) {
     const recipient = smsFallbackNumber.replace(/[^\d+]/g, "");
-    const encodedBody = encodeURIComponent(normalizeOneLine(message));
+    const encodedBody = encodeURIComponent(canonicalizeSmsFallbackMessage(message));
     const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent);
     const smsUri = isIos
       ? `sms:${recipient}&body=${encodedBody}`
