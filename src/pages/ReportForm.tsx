@@ -29,10 +29,13 @@ import {
 import { addDoc, collection, doc, getDoc, getDocFromServer, serverTimestamp } from "firebase/firestore";
 import { uploadImageToFirebaseStorage } from "@/lib/storageUpload";
 import {
-  addOfflineSmsReport,
-  markOfflineSmsReportAttempted,
-  type OfflineSmsReportEntry,
-} from "@/lib/offlineSmsReports";
+  addOfflineQueuedReport,
+  getPendingOfflineQueuedReportsByResident,
+  markOfflineQueuedReportAttempted,
+  markOfflineQueuedReportFailed,
+  markOfflineQueuedReportSent,
+  type OfflineQueuedReportEntry,
+} from "@/lib/offlineQueuedReports";
 import { toast } from "sonner";
 
 const categories: { id: IncidentCategory; icon: typeof Flame; label: string; color: string }[] = [
@@ -103,7 +106,7 @@ export default function ReportForm() {
   const [residentBarangay, setResidentBarangay] = useState<string | null>(null);
   const [residentPhone, setResidentPhone] = useState<string | null>(null);
   const [verificationMessage, setVerificationMessage] = useState<string | null>(null);
-  const [submitted, setSubmitted] = useState(false);
+  const [submittedMode, setSubmittedMode] = useState<"sent" | "queued" | null>(null);
   const [offline, setOffline] = useState(!navigator.onLine);
   const [forceOfflineMode, setForceOfflineMode] = useState(false);
   const [submitConfirmOpen, setSubmitConfirmOpen] = useState(false);
@@ -111,134 +114,106 @@ export default function ReportForm() {
 
   const effectiveOffline = offline || forceOfflineMode;
 
-  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "+639177044103";
+  const submitted = submittedMode !== null;
 
-  function categoryToSmsLabel(value: IncidentCategory) {
-    if (value === "fire") return "FIRE";
-    if (value === "medical") return "MEDICAL";
-    if (value === "crime") return "CRIME";
-    return "DISASTER";
-  }
-
-  function normalizeSmsFieldValue(value: string) {
-    return value
-      .replace(/[;|]+/g, " ")
-      .replace(/\r\n|\n|\r/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function normalizeOneLine(value: string) {
-    return value
-      .replace(/\r\n|\n|\r/g, " ")
-      .replace(/\s+/g, " ")
-      .replace(/\s*;\s*/g, "; ")
-      .trim();
-  }
-
-  function canonicalizeSmsFallbackMessage(value: string) {
-    let normalized = normalizeOneLine(value).replace(/;/g, " ");
-
-    normalized = normalized.replace(
-      /\s+(CATEGORY:|LOCATION:|COORDS:|DESCRIPTION:|REPORTER:|TIME:)\s*/gi,
-      "; $1 "
-    );
-
-    normalized = normalized.replace(
-      /^\s*MDRRMO INCIDENT REPORT\s*/i,
-      "MDRRMO INCIDENT REPORT; "
-    );
-
-    return normalized
-      .replace(/;\s*;/g, "; ")
-      .replace(/\s+/g, " ")
-      .replace(/\s*;\s*/g, "; ")
-      .trim();
-  }
-
-  function buildSmsFallbackMessage() {
-    if (!category || !location || !coordinates) {
-      const missing: string[] = [];
-      if (!category) missing.push("category");
-      if (!location || !coordinates) missing.push("location");
-      setSubmitError(`Please complete required fields: ${missing.join(" and ")}.`);
-      return null;
-    }
-
-    const oneLineLocation = normalizeSmsFieldValue(location);
-    const oneLineDescription = normalizeSmsFieldValue(description) || "N/A";
-    const oneLineReporter = normalizeSmsFieldValue(user?.name || "Resident");
-
-    const messageLines = [
-      "MDRRMO INCIDENT REPORT",
-      `CATEGORY: ${categoryToSmsLabel(category)}`,
-      `LOCATION: ${oneLineLocation}`,
-      `COORDS: ${coordinates.lat.toFixed(5)}, ${coordinates.lng.toFixed(5)}`,
-      `DESCRIPTION: ${oneLineDescription}`,
-      `REPORTER: ${oneLineReporter}`,
-      `TIME: ${new Date().toLocaleString()}`,
-    ];
-
-    return messageLines.join("; ");
-  }
-
-  function launchSmsFallback(message: string) {
-    const recipient = smsFallbackNumber.replace(/[^\d+]/g, "");
-    const encodedBody = encodeURIComponent(canonicalizeSmsFallbackMessage(message));
-    const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent);
-    const smsUri = isIos
-      ? `sms:${recipient}&body=${encodedBody}`
-      : `sms:${recipient}?body=${encodedBody}`;
-
-    const openUri = (uri: string) => {
-      try {
-        window.location.href = uri;
-      } catch {
-        const anchor = document.createElement("a");
-        anchor.href = uri;
-        anchor.style.display = "none";
-        document.body.appendChild(anchor);
-        anchor.click();
-        document.body.removeChild(anchor);
-      }
-    };
-
-    openUri(smsUri);
-
-    // Android fallback for environments where sms: URI does not trigger reliably.
-    if (!isIos) {
-      window.setTimeout(() => {
-        if (!document.hidden) {
-          openUri(`smsto:${recipient}?body=${encodedBody}`);
-        }
-      }, 250);
-    }
-  }
-
-  function queueOfflineSmsHistory(message: string) {
+  function queueOfflineReport() {
     if (!user || user.role !== "resident" || !category || !coordinates) {
       return null;
     }
 
-    const entry: OfflineSmsReportEntry = {
-      id: `offline-sms-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    const entry: OfflineQueuedReportEntry = {
+      id: `offline-report-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       residentId: user.id,
+      residentName: user.name,
+      residentEmail: user.email,
+      residentPhone: residentPhone || "",
+      barangay: residentBarangay || "Banisilan",
       category,
       description: description.trim(),
       location,
       coordinates,
       createdAtIso: new Date().toISOString(),
-      smsNumber: smsFallbackNumber,
-      smsBody: message,
       deliveryStatus: "queued",
       lastAttemptAtIso: null,
       sentAtIso: null,
       failureReason: null,
-      semaphoreMessageId: null,
+      incidentId: null,
     };
 
-    addOfflineSmsReport(entry);
+    addOfflineQueuedReport(entry);
     return entry;
+  }
+
+  function getPriorityByCategory(value: IncidentCategory): "Critical" | "High" {
+    if (value === "fire" || value === "medical") {
+      return "Critical";
+    }
+    return "High";
+  }
+
+  function getTitleByCategory(value: IncidentCategory): string {
+    if (value === "fire") return "Fire Incident";
+    if (value === "medical") return "Medical Emergency";
+    if (value === "disaster") return "Disaster Incident";
+    return "Crime Incident";
+  }
+
+  function isConnectivityError(error: unknown) {
+    const code = (error as { code?: string })?.code || "";
+    return code === "unavailable" || code === "deadline-exceeded" || code === "resource-exhausted";
+  }
+
+  async function submitIncidentToFirestore(payload: {
+    residentId: string;
+    residentName: string;
+    residentEmail: string;
+    residentPhone: string;
+    barangay: string;
+    category: IncidentCategory;
+    description: string;
+    location: string;
+    coordinates: { lat: number; lng: number };
+    photoFile?: File | null;
+  }) {
+    let uploadedPhotoUrl: string | null = null;
+
+    if (payload.photoFile) {
+      setUploadingPhoto(true);
+      try {
+        uploadedPhotoUrl = await uploadImageToFirebaseStorage(payload.photoFile);
+      } finally {
+        setUploadingPhoto(false);
+      }
+    }
+
+    const incidentRef = await addDoc(collection(db, "incidents"), {
+      title: getTitleByCategory(payload.category),
+      category: payload.category,
+      description: payload.description,
+      priority: getPriorityByCategory(payload.category),
+      status: "Pending",
+      source: "Web",
+      location: payload.location,
+      barangay: payload.barangay,
+      lat: payload.coordinates.lat,
+      lng: payload.coordinates.lng,
+      photoUrl: uploadedPhotoUrl,
+      residentId: payload.residentId,
+      residentName: payload.residentName,
+      residentEmail: payload.residentEmail,
+      residentPhone: payload.residentPhone,
+      assignedResponders: [],
+      reportedAt: serverTimestamp(),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    const createdDoc = await getDocFromServer(incidentRef);
+    if (!createdDoc.exists()) {
+      throw new Error(`Incident write was not visible on server yet. Doc ID: ${incidentRef.id}`);
+    }
+
+    return incidentRef.id;
   }
 
   useEffect(() => {
@@ -255,6 +230,68 @@ export default function ReportForm() {
       window.removeEventListener("offline", handleOffline);
     };
   }, []);
+
+  useEffect(() => {
+    if (!user || user.role !== "resident" || !isResidentVerified) {
+      return;
+    }
+
+    let disposed = false;
+    let syncing = false;
+
+    const syncQueuedReports = async () => {
+      if (disposed || syncing || !navigator.onLine) {
+        return;
+      }
+
+      syncing = true;
+      const pending = getPendingOfflineQueuedReportsByResident(user.id);
+
+      for (const entry of pending) {
+        if (disposed || !navigator.onLine) {
+          break;
+        }
+
+        markOfflineQueuedReportAttempted(entry.id);
+        try {
+          const incidentId = await submitIncidentToFirestore({
+            residentId: entry.residentId,
+            residentName: entry.residentName,
+            residentEmail: entry.residentEmail,
+            residentPhone: entry.residentPhone,
+            barangay: entry.barangay,
+            category: entry.category,
+            description: entry.description,
+            location: entry.location,
+            coordinates: entry.coordinates,
+            photoFile: null,
+          });
+          markOfflineQueuedReportSent(entry.id, incidentId);
+        } catch (error) {
+          const reason = (error as { message?: string }).message || "Unable to auto-send queued report.";
+          markOfflineQueuedReportFailed(entry.id, reason);
+          if (!isConnectivityError(error)) {
+            // Stop on non-network errors (e.g., permission), avoid retry storm.
+            break;
+          }
+        }
+      }
+
+      syncing = false;
+    };
+
+    const onOnline = () => {
+      void syncQueuedReports();
+    };
+
+    window.addEventListener("online", onOnline);
+    void syncQueuedReports();
+
+    return () => {
+      disposed = true;
+      window.removeEventListener("online", onOnline);
+    };
+  }, [user, isResidentVerified]);
 
   useEffect(() => {
     let mounted = true;
@@ -590,27 +627,14 @@ export default function ReportForm() {
 
     if (effectiveOffline) {
       setSubmitError(null);
-      const smsMessage = buildSmsFallbackMessage();
-      if (!smsMessage) {
-        return;
-      }
-
-      const queuedEntry = queueOfflineSmsHistory(smsMessage);
+      const queuedEntry = queueOfflineReport();
       if (!queuedEntry) {
-        setSubmitError("Unable to queue SMS fallback report right now.");
+        setSubmitError("Unable to queue offline report right now.");
         return;
       }
 
-      if (!navigator.onLine) {
-        toast.info("No internet connection. Opening SMS app now. Send the report SMS to continue.");
-      } else {
-        toast.info("SMS fallback mode is active. Opening SMS app now. Send the report SMS to continue.");
-      }
-
-      launchSmsFallback(smsMessage);
-      markOfflineSmsReportAttempted(queuedEntry.id);
-
-      setSubmitted(true);
+      toast.success("Report saved offline. It will auto-send once internet is available.");
+      setSubmittedMode("queued");
       return;
     }
 
@@ -631,73 +655,39 @@ export default function ReportForm() {
 
     setIsSubmitting(true);
 
-    const priorityByCategory: Record<IncidentCategory, "Critical" | "High"> = {
-      fire: "Critical",
-      medical: "Critical",
-      disaster: "High",
-      crime: "High",
-    };
-
-    const titleByCategory: Record<IncidentCategory, string> = {
-      fire: "Fire Incident",
-      medical: "Medical Emergency",
-      disaster: "Disaster Incident",
-      crime: "Crime Incident",
-    };
-
-    let uploadedPhotoUrl: string | null = null;
-    if (photoFile) {
-      setUploadingPhoto(true);
-      try {
-        uploadedPhotoUrl = await uploadImageToFirebaseStorage(photoFile);
-      } catch (error) {
-        const message = (error as Error).message || "Unable to upload photo right now. Please try again.";
-        setSubmitError(message);
-        setUploadingPhoto(false);
-        setIsSubmitting(false);
-        return;
-      } finally {
-        setUploadingPhoto(false);
-      }
-    }
-
     try {
-      const incidentRef = await addDoc(collection(db, "incidents"), {
-        title: titleByCategory[category],
-        category,
-        description: description.trim(),
-        priority: priorityByCategory[category],
-        status: "Pending",
-        source: "Web",
-        location,
-        barangay: residentBarangay || "Banisilan",
-        lat: coordinates.lat,
-        lng: coordinates.lng,
-        photoUrl: uploadedPhotoUrl,
+      const incidentId = await submitIncidentToFirestore({
         residentId: user.id,
         residentName: user.name,
         residentEmail: user.email,
         residentPhone: residentPhone || "",
-        assignedResponders: [],
-        reportedAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+        barangay: residentBarangay || "Banisilan",
+        category,
+        description: description.trim(),
+        location,
+        coordinates,
+        photoFile,
       });
 
-      const createdDoc = await getDocFromServer(incidentRef);
-      if (!createdDoc.exists()) {
-        throw new Error(`Incident write was not visible on server yet. Doc ID: ${incidentRef.id}`);
-      }
-
-      toast.success(`Report saved: ${incidentRef.id}`);
+      toast.success(`Report saved: ${incidentId}`);
       console.info("[report-submit] incident-created", {
         projectId: firebaseProjectId,
-        incidentId: incidentRef.id,
+        incidentId,
         residentId: user.id,
       });
     } catch (error) {
       const code = (error as { code?: string }).code || "unknown";
       const message = (error as { message?: string }).message || "unknown error";
+
+      if (isConnectivityError(error) || !navigator.onLine) {
+        const queuedEntry = queueOfflineReport();
+        if (queuedEntry) {
+          toast.info("No stable connection. Report queued and will auto-send when internet returns.");
+          setSubmittedMode("queued");
+          setIsSubmitting(false);
+          return;
+        }
+      }
 
       if ((error as { code?: string }).code === "permission-denied") {
         if (typeof window !== "undefined") {
@@ -719,7 +709,7 @@ export default function ReportForm() {
       return;
     }
 
-    setSubmitted(true);
+    setSubmittedMode("sent");
     setIsSubmitting(false);
   }
 
@@ -744,7 +734,9 @@ export default function ReportForm() {
         </div>
         <h2 className="text-xl font-bold text-foreground">Report Submitted</h2>
         <p className="text-sm text-muted-foreground max-w-xs">
-          Your emergency report has been received. Help is being coordinated.
+          {submittedMode === "queued"
+            ? "Your report is saved offline and will be sent automatically when internet is available."
+            : "Your emergency report has been received. Help is being coordinated."}
           You can track your report status.
         </p>
         <div className="flex gap-3 mt-4 w-full max-w-xs">
@@ -1005,7 +997,7 @@ export default function ReportForm() {
       {/* Submit */}
       <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-white/55 bg-white/50 px-3 py-2 backdrop-blur-md">
         <p className="text-xs text-muted-foreground">
-          Manual test toggle for SMS fallback mode.
+          Manual test toggle for offline queue mode.
         </p>
         <button
           onClick={() => setForceOfflineMode((current) => !current)}
@@ -1023,7 +1015,7 @@ export default function ReportForm() {
       {effectiveOffline && (
         <div className="mb-3 rounded-xl border-2 border-dashed border-warning bg-warning-light px-3 py-2">
           <p className="text-xs font-semibold text-warning-foreground">
-            SMS fallback mode is active. The app will open your SMS app to send one incident message to {smsFallbackNumber}. After gateway receive, admin will review and convert it to an incident report.
+            Offline queue mode is active. Reports are saved in-app first, then automatically submitted when internet connection is detected.
           </p>
         </div>
       )}
@@ -1064,7 +1056,7 @@ export default function ReportForm() {
             Submitting report...
           </span>
         ) : (
-          effectiveOffline ? "Send via SMS Fallback" : "Submit Report"
+          effectiveOffline ? "Save Offline & Auto-Send" : "Submit Report"
         )}
       </button>
       {submitError && <p className="mt-2 text-xs text-destructive">{submitError}</p>}
@@ -1073,11 +1065,11 @@ export default function ReportForm() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {effectiveOffline ? "Send SMS fallback report now?" : "Submit incident report now?"}
+              {effectiveOffline ? "Save this report offline now?" : "Submit incident report now?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {effectiveOffline
-                ? "This uses SMS fallback only: open SMS app, send the formatted one-line report, then gateway/admin intake and conversion follows."
+                ? "The report will be stored in the app and automatically submitted once internet connection is available."
                 : "Please confirm the report details are correct before sending to MDRRMO."}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -1089,7 +1081,7 @@ export default function ReportForm() {
                 void handleSubmit();
               }}
             >
-              {effectiveOffline ? "Send via SMS Fallback" : "Submit Report"}
+              {effectiveOffline ? "Save Offline" : "Submit Report"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

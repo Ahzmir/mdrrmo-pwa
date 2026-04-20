@@ -65,10 +65,17 @@ async function storeInboundSms({ sender, message, source, extra = {} }) {
     smsInboxRef.set(basePayload, { merge: true }),
   ]);
 
+  const autoConversionResult = await autoConvertStructuredIncomingSms({
+    smsId,
+    incomingRef,
+    smsInboxRef,
+  });
+
   return {
     smsId,
     incomingRef,
     smsInboxRef,
+    autoConversionResult,
   };
 }
 
@@ -189,12 +196,18 @@ function isStructuredIncidentReportSms(message) {
     return false;
   }
 
-  if (/\r|\n/.test(source)) {
+  const normalized = source.replace(/\r\n|\n|\r/g, " ").replace(/\s+/g, " ").trim();
+  if (!/^MDRRMO\s+INCIDENT\s+REPORT\b/i.test(normalized)) {
     return false;
   }
 
-  const strictPattern = /^MDRRMO INCIDENT REPORT;\s*CATEGORY:\s*[^;]+;\s*LOCATION:\s*[^;]+;\s*COORDS:\s*[^;]+;\s*DESCRIPTION:\s*[^;]*;\s*REPORTER:\s*[^;]+;\s*TIME:\s*.+$/i;
-  return strictPattern.test(source);
+  return (
+    /\bCATEGORY\s*:/i.test(normalized) &&
+    /\bLOCATION\s*:/i.test(normalized) &&
+    /\bDESCRIPTION\s*:/i.test(normalized) &&
+    /\bREPORTER\s*:/i.test(normalized) &&
+    /\bTIME\s*:/i.test(normalized)
+  );
 }
 
 function normalizeIncidentCategory(value) {
@@ -414,6 +427,114 @@ function buildIncidentFromInboundSms({ smsId, data }) {
   };
 }
 
+function formatIncidentTitleFromCategory(category) {
+  if (category === "fire") return "Fire Incident";
+  if (category === "medical") return "Medical Incident";
+  if (category === "crime") return "Crime Incident";
+  return "Disaster Incident";
+}
+
+function parseStructuredSmsReportedAt(message, fallbackDate) {
+  const labeledTime = extractLabeledSmsValue(message, "TIME");
+  const parsedFromLabel = labeledTime ? toDateValue(labeledTime) : null;
+  return parsedFromLabel || fallbackDate;
+}
+
+async function autoConvertStructuredIncomingSms({ smsId, incomingRef, smsInboxRef }) {
+  const incidentRef = db.collection("incidents").doc();
+
+  const result = await db.runTransaction(async (tx) => {
+    const smsSnap = await tx.get(incomingRef);
+    if (!smsSnap.exists) {
+      return { converted: false, reason: "missing_sms" };
+    }
+
+    const smsData = smsSnap.data() || {};
+    const alreadyConverted = smsData.converted === true;
+    const existingIncidentId = toTrimmedString(smsData.incidentId);
+    if (alreadyConverted || existingIncidentId) {
+      return { converted: false, reason: "already_converted", incidentId: existingIncidentId || null };
+    }
+
+    const sender =
+      toTrimmedString(smsData.sender) ||
+      toTrimmedString(smsData.phone) ||
+      toTrimmedString(smsData.from) ||
+      "Unknown Sender";
+    const message =
+      toTrimmedString(smsData.message) ||
+      toTrimmedString(smsData.body) ||
+      toTrimmedString(smsData.text) ||
+      "";
+
+    if (!message || !isStructuredIncidentReportSms(message)) {
+      return { converted: false, reason: "not_structured" };
+    }
+
+    const category =
+      normalizeIncidentCategory(extractLabeledSmsValue(message, "CATEGORY")) ||
+      inferIncidentCategoryFromSmsMessage(message);
+    const location = extractLabeledSmsValue(message, "LOCATION") || "Reported via SMS";
+    const description = extractLabeledSmsValue(message, "DESCRIPTION") || message;
+    const reporter = extractLabeledSmsValue(message, "REPORTER") || sender;
+    const coordinates = parseCoordinatesFromSmsMessage(message);
+    const fallbackReportedAt =
+      toDateValue(smsData.gatewayReceivedAt) ||
+      toDateValue(smsData.receivedAt) ||
+      toDateValue(smsData.createdAt) ||
+      new Date();
+    const reportedAt = parseStructuredSmsReportedAt(message, fallbackReportedAt);
+
+    const incidentPayload = {
+      title: formatIncidentTitleFromCategory(category),
+      category,
+      description,
+      location,
+      barangay: "Unknown",
+      priority: inferIncidentPriorityFromSmsMessage(message, category),
+      status: "pending",
+      source: "Offline",
+      lat: coordinates ? coordinates.lat : 0,
+      lng: coordinates ? coordinates.lng : 0,
+      assignedResponders: [],
+      residentId: `sms:${smsId}`,
+      residentName: reporter,
+      residentEmail: sender,
+      residentPhone: sender,
+      photoUrl: null,
+      reportedAt: admin.firestore.Timestamp.fromDate(reportedAt),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      smsReportId: smsId,
+      smsSourceCollection: "incoming_sms",
+      smsSender: sender,
+      smsProvider: toTrimmedString(smsData.provider) || null,
+    };
+
+    tx.set(incidentRef, incidentPayload);
+
+    const smsUpdate = {
+      converted: true,
+      incidentId: incidentRef.id,
+      convertedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    tx.update(incomingRef, smsUpdate);
+    tx.set(smsInboxRef, smsUpdate, { merge: true });
+
+    return { converted: true, reason: "created", incidentId: incidentRef.id };
+  });
+
+  if (result.converted) {
+    logger.info("Auto-converted incoming SMS to incident", {
+      smsId,
+      incidentId: result.incidentId || null,
+    });
+  }
+
+  return result;
+}
+
 function sanitizeDocIdSegment(value) {
   const normalized = toTrimmedString(value).replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
   return normalized.slice(0, 80);
@@ -458,6 +579,59 @@ function normalizeSmsMobileInboxItems(payload) {
   return [];
 }
 
+function toUnixTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    const numeric = Math.floor(value);
+    // Auto-normalize milliseconds to seconds.
+    return numeric > 9999999999 ? Math.floor(numeric / 1000) : numeric;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      const asInt = Math.floor(numeric);
+      return asInt > 9999999999 ? Math.floor(asInt / 1000) : asInt;
+    }
+
+    const parsedDate = new Date(trimmed);
+    if (!Number.isNaN(parsedDate.getTime())) {
+      return Math.floor(parsedDate.getTime() / 1000);
+    }
+  }
+
+  return null;
+}
+
+function extractSmsMobileInboxTimestampUnix(row) {
+  if (!row || typeof row !== "object") {
+    return null;
+  }
+
+  const candidates = [
+    row.timestamp_unix,
+    row.unix,
+    row.timestampUnix,
+    row.received_unix,
+    row.receivedAt,
+    row.timestamp,
+    row.date,
+  ];
+
+  for (const value of candidates) {
+    const parsed = toUnixTimestamp(value);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
 function parseSmsMobileInboxItem(row) {
   if (!row || typeof row !== "object") {
     return null;
@@ -486,10 +660,9 @@ function parseSmsMobileInboxItem(row) {
     toTrimmedString(row.smsId) ||
     toTrimmedString(row.id) ||
     null;
+  const rowTimestampUnix = extractSmsMobileInboxTimestampUnix(row);
   const gatewayReceivedAt =
-    (typeof row.timestamp_unix === "number" && Number.isFinite(row.timestamp_unix)
-      ? new Date(row.timestamp_unix * 1000).toISOString()
-      : "") ||
+    (rowTimestampUnix ? new Date(rowTimestampUnix * 1000).toISOString() : "") ||
     toTrimmedString(row.receivedAt) ||
     toTrimmedString(row.timestamp) ||
     toTrimmedString(row.date) ||
@@ -631,21 +804,99 @@ exports.syncSmsMobileInbox = onCall(async (request) => {
       : 50;
   const limit = Math.max(1, Math.min(200, Math.floor(requestedLimit)));
 
+  const syncStateRef = db.collection("system").doc("smsmobileapiSync");
+  const syncStateSnap = await syncStateRef.get();
+  const existingState = syncStateSnap.exists ? syncStateSnap.data() || {} : {};
+  const existingCursor =
+    typeof existingState.afterTimestampUnix === "number" && Number.isFinite(existingState.afterTimestampUnix)
+      ? Math.floor(existingState.afterTimestampUnix)
+      : null;
+  const nowUnix = Math.floor(Date.now() / 1000);
+  let effectiveCursor = existingCursor;
+
+  // Self-heal if cursor is invalidly far in the future (often from ms/sec mismatch).
+  if (effectiveCursor && effectiveCursor > nowUnix + 600) {
+    effectiveCursor = nowUnix - 300;
+    await syncStateRef.set({
+      afterTimestampUnix: effectiveCursor,
+      repairedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    logger.warn("syncSmsMobileInbox cursor repaired", {
+      previousCursor: existingCursor,
+      repairedCursor: effectiveCursor,
+      nowUnix,
+    });
+  }
+
+  logger.info("syncSmsMobileInbox start", {
+    limit,
+    existingCursor,
+    effectiveCursor,
+    uid: request.auth?.uid || null,
+  });
+
+  // Small slack window prevents misses from provider/device clock skew.
+  const fetchCursor = effectiveCursor ? Math.max(1, effectiveCursor - 300) : null;
+
+  // First run sets a baseline so we do not import historical SMS backlog.
+  if (!effectiveCursor) {
+    await syncStateRef.set({
+      afterTimestampUnix: nowUnix,
+      initializedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    return {
+      ok: true,
+      provider: "smsmobileapi",
+      fetched: 0,
+      ingested: 0,
+      skipped: 0,
+      filteredOut: 0,
+      initialized: true,
+      cursor: nowUnix,
+      message: "Sync cursor initialized. Only new messages from this point onward will be fetched.",
+    };
+  }
+
   const inboxPayload = await fetchSmsMobileInbox({
     apiKey: SMSMOBILEAPI_API_KEY,
     limit,
+    afterTimestampUnix: fetchCursor,
   });
   const inboxRows = normalizeSmsMobileInboxItems(inboxPayload);
+
+  logger.info("syncSmsMobileInbox fetched rows", {
+    fetched: inboxRows.length,
+    sampleKeys: inboxRows.length > 0 && inboxRows[0] && typeof inboxRows[0] === "object"
+      ? Object.keys(inboxRows[0]).slice(0, 12)
+      : [],
+  });
 
   let ingested = 0;
   let skipped = 0;
   let filteredOut = 0;
+  let olderThanCursor = 0;
+  let maxTimestampUnix = effectiveCursor;
 
   for (const row of inboxRows) {
+    const rowTimestampUnix = extractSmsMobileInboxTimestampUnix(row);
+    if (rowTimestampUnix && fetchCursor && rowTimestampUnix <= fetchCursor) {
+      olderThanCursor += 1;
+      skipped += 1;
+      continue;
+    }
+
     const parsed = parseSmsMobileInboxItem(row);
     if (!parsed) {
       skipped += 1;
       continue;
+    }
+
+    if (rowTimestampUnix && rowTimestampUnix > maxTimestampUnix) {
+      maxTimestampUnix = rowTimestampUnix;
     }
 
     if (!isStructuredIncidentReportSms(parsed.message)) {
@@ -679,6 +930,43 @@ exports.syncSmsMobileInbox = onCall(async (request) => {
     ingested += 1;
   }
 
+  if (maxTimestampUnix > effectiveCursor) {
+    await syncStateRef.set({
+      afterTimestampUnix: maxTimestampUnix,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+
+  let backfillConverted = 0;
+  const pendingSmsSnap = await db
+    .collection("incoming_sms")
+    .where("converted", "==", false)
+    .limit(50)
+    .get();
+
+  for (const smsDoc of pendingSmsSnap.docs) {
+    const conversion = await autoConvertStructuredIncomingSms({
+      smsId: smsDoc.id,
+      incomingRef: smsDoc.ref,
+      smsInboxRef: db.collection("smsInbox").doc(smsDoc.id),
+    });
+    if (conversion.converted) {
+      backfillConverted += 1;
+    }
+  }
+
+  logger.info("syncSmsMobileInbox completed", {
+    fetched: inboxRows.length,
+    ingested,
+    skipped,
+    filteredOut,
+    olderThanCursor,
+    backfillConverted,
+    previousCursor: effectiveCursor,
+    fetchCursor,
+    nextCursor: maxTimestampUnix,
+  });
+
   return {
     ok: true,
     provider: "smsmobileapi",
@@ -686,6 +974,10 @@ exports.syncSmsMobileInbox = onCall(async (request) => {
     ingested,
     skipped,
     filteredOut,
+    olderThanCursor,
+    backfillConverted,
+    initialized: false,
+    cursor: maxTimestampUnix,
   };
 });
 

@@ -419,7 +419,7 @@ service cloud.firestore {
           && request.resource.data.barangay is string
           && request.resource.data.priority in ["Critical", "High", "Low"]
           && request.resource.data.status in ["Pending", "pending"]
-          && request.resource.data.source in ["Web", "SMS", "Call", "Radio"]
+          && request.resource.data.source in ["Web", "SMS", "Call", "Radio", "Offline"]
           && request.resource.data.lat is number
           && request.resource.data.lng is number
           && request.resource.data.assignedResponders is list

@@ -9,7 +9,7 @@ import {
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { IncidentReport, IncidentCategory, ReportStatus } from "@/types/incident";
-import { getPendingOfflineSmsReportsByResident, subscribeOfflineSmsReports } from "@/lib/offlineSmsReports";
+import { getPendingOfflineQueuedReportsByResident, subscribeOfflineQueuedReports } from "@/lib/offlineQueuedReports";
 
 function toDate(value: unknown): Date | null {
   if (value instanceof Timestamp) return value.toDate();
@@ -56,7 +56,7 @@ export function useReports() {
     }
 
     const loadOfflineReports = () => {
-      const rows = getPendingOfflineSmsReportsByResident(user.id).map((entry) => ({
+      const rows = getPendingOfflineQueuedReportsByResident(user.id).map((entry) => ({
         id: entry.id,
         category: entry.category as IncidentCategory,
         description: entry.description,
@@ -67,7 +67,6 @@ export function useReports() {
         updatedAt: new Date(entry.createdAtIso),
         source: "offline_sms",
         offlineSmsPending: true,
-        smsNumber: entry.smsNumber,
       } satisfies IncidentReport));
 
       rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
@@ -75,7 +74,7 @@ export function useReports() {
     };
 
     loadOfflineReports();
-    const unsubscribe = subscribeOfflineSmsReports(loadOfflineReports);
+    const unsubscribe = subscribeOfflineQueuedReports(loadOfflineReports);
     return () => unsubscribe();
   }, [user]);
 
