@@ -124,6 +124,10 @@ export default function ReportForm() {
     return "DISASTER";
   }
 
+  function normalizeOneLine(value: string) {
+    return value.replace(/\r\n|\n|\r/g, " ").replace(/\s+/g, " ").trim();
+  }
+
   function buildSmsFallbackMessage() {
     if (!category || !location || !coordinates) {
       const missing: string[] = [];
@@ -133,21 +137,25 @@ export default function ReportForm() {
       return null;
     }
 
+    const oneLineLocation = normalizeOneLine(location);
+    const oneLineDescription = normalizeOneLine(description) || "N/A";
+    const oneLineReporter = normalizeOneLine(user?.name || "Resident");
+
     const messageLines = [
       "MDRRMO INCIDENT REPORT",
       `CATEGORY: ${categoryToSmsLabel(category)}`,
-      `LOCATION: ${location}`,
+      `LOCATION: ${oneLineLocation}`,
       `COORDS: ${coordinates.lat.toFixed(5)}, ${coordinates.lng.toFixed(5)}`,
-      `DESCRIPTION: ${description.trim() || "N/A"}`,
-      `REPORTER: ${user?.name || "Resident"}`,
+      `DESCRIPTION: ${oneLineDescription}`,
+      `REPORTER: ${oneLineReporter}`,
       `TIME: ${new Date().toLocaleString()}`,
     ];
 
-    return messageLines.join(" | ");
+    return messageLines.join("; ");
   }
 
   function launchSmsFallback(message: string) {
-    const encodedBody = encodeURIComponent(message);
+    const encodedBody = encodeURIComponent(normalizeOneLine(message));
     const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent);
     const smsUri = isIos
       ? `sms:${smsFallbackNumber}&body=${encodedBody}`

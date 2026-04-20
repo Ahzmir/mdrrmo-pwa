@@ -76,6 +76,13 @@ function toTrimmedString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function toSingleLineText(value) {
+  return toTrimmedString(value)
+    .replace(/\r\n|\n|\r/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function safeTokenEquals(left, right) {
   if (!left || !right) {
     return false;
@@ -148,7 +155,7 @@ function toDateValue(value) {
 }
 
 function extractLabeledSmsValue(message, label) {
-  const matcher = new RegExp(`(?:^|\\||\\n)\\s*${label}\\s*:\\s*([^|\\n]+)`, "i");
+  const matcher = new RegExp(`(?:^|\\||;|\\n)\\s*${label}\\s*:\\s*(.+?)(?=(?:\\s*(?:\\||;|\\n)\\s*[A-Z_]+\\s*:)|$)`, "i");
   const match = message.match(matcher);
   if (!match || typeof match[1] !== "string") {
     return null;
@@ -458,7 +465,7 @@ function parseSmsMobileInboxItem(row) {
 
 function parseSmsFallbackPayload(data) {
   const reportId = typeof data?.reportId === "string" ? data.reportId.trim() : "";
-  const smsBody = typeof data?.smsBody === "string" ? data.smsBody.trim() : "";
+  const smsBody = toSingleLineText(data?.smsBody);
   const category = typeof data?.category === "string" ? data.category.trim().toLowerCase() : "";
   const location = typeof data?.location === "string" ? data.location.trim() : "";
   const description = typeof data?.description === "string" ? data.description.trim() : "";
@@ -833,19 +840,20 @@ exports.deleteResidentAccount = onCall(async (request) => {
 exports.submitSmsFallbackReport = onCall(async (request) => {
   const resident = await assertResidentCaller(request);
   const payload = parseSmsFallbackPayload(request.data);
+  const smsBody = toSingleLineText(payload.smsBody);
 
   try {
     const smsmobileResponse = await sendSmsMobileApi({
       apiKey: SMSMOBILEAPI_API_KEY,
       destination: SMSMOBILEAPI_DESTINATION,
-      message: payload.smsBody,
+      message: smsBody,
     });
 
     const senderIdentity = payload.reporterPhone || resident.phone || payload.reporterEmail || resident.email || resident.uid;
 
     await storeInboundSms({
       sender: senderIdentity,
-      message: payload.smsBody,
+      message: smsBody,
       source: "smsmobileapi",
       extra: {
         provider: "smsmobileapi",
