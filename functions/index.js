@@ -1,4 +1,4 @@
-const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
@@ -212,4 +212,49 @@ exports.deleteResidentAccount = onCall(async (request) => {
     ok: true,
     authDeleted,
   };
+});
+
+exports.twilioInboundSms = onRequest(async (req, res) => {
+  if (req.method !== "POST") {
+    res.status(405).send("Method Not Allowed");
+    return;
+  }
+
+  try {
+    let payload = req.body;
+    if (!payload || typeof payload !== "object") {
+      const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody.toString("utf8") : "";
+      payload = Object.fromEntries(new URLSearchParams(raw));
+    }
+
+    const sender =
+      (typeof payload.From === "string" && payload.From.trim()) ||
+      (typeof payload.from === "string" && payload.from.trim()) ||
+      "Unknown sender";
+    const message =
+      (typeof payload.Body === "string" && payload.Body.trim()) ||
+      (typeof payload.body === "string" && payload.body.trim()) ||
+      "";
+
+    await db.collection("smsInbox").add({
+      sender,
+      phone: sender,
+      from: sender,
+      message,
+      body: message,
+      source: "twilio",
+      converted: false,
+      receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Twilio expects valid XML response.
+    res.set("Content-Type", "text/xml");
+    res.status(200).send("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response></Response>");
+  } catch (error) {
+    logger.error("Failed to process Twilio inbound SMS", {
+      message: error?.message,
+    });
+    res.status(500).send("Internal Server Error");
+  }
 });

@@ -25,7 +25,9 @@
     "strict": false,
     "target": "ES2020",
     "types": [
-      "vitest/globals"
+      "vite/client",
+      "vitest/globals",
+      "google.maps"
     ],
     "useDefineForClassFields": true
   },

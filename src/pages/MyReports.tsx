@@ -1,24 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Inbox, MapPin, Route } from "lucide-react";
+import { ArrowLeft, Inbox, Loader2, MapPin, Route } from "lucide-react";
 import { useReports } from "@/hooks/useReports";
 import { CategoryIcon } from "@/components/CategoryIcon";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { db } from "@/lib/firebase";
+import { loadGoogleMapsApi } from "@/lib/googleMaps";
 import { Timestamp, collection, doc, onSnapshot } from "firebase/firestore";
-import L from "leaflet";
-import { MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet";
-import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
-import markerIcon from "leaflet/dist/images/marker-icon.png";
-import markerShadow from "leaflet/dist/images/marker-shadow.png";
-import "leaflet/dist/leaflet.css";
 
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: markerIcon2x,
-  iconUrl: markerIcon,
-  shadowUrl: markerShadow,
-});
+const GOOGLE_MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
+
+type LatLng = [number, number];
 
 type ResponderLiveRow = {
   uid: string;
@@ -28,6 +21,224 @@ type ResponderLiveRow = {
 };
 
 type ResponderNameDirectory = Map<string, string>;
+
+type ResponderRouteRow = {
+  uid: string;
+  lat: number;
+  lng: number;
+  updatedAt: Date | null;
+  points: LatLng[];
+  distanceMeters: number | null;
+  durationSeconds: number | null;
+};
+
+type RouteProgressState = "near" | "approaching" | "en_route" | "moving_away";
+
+type GoogleRoutesApiResponse = {
+  routes?: Array<{
+    distanceMeters?: number;
+    duration?: string;
+    polyline?: { encodedPolyline?: string };
+  }>;
+};
+
+function toNullableNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function parseDurationSeconds(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const parsed = Number(value.replace(/s$/, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function decodePolyline(encoded: string): LatLng[] {
+  const points: LatLng[] = [];
+  let index = 0;
+  let lat = 0;
+  let lng = 0;
+
+  while (index < encoded.length) {
+    let result = 0;
+    let shift = 0;
+    let byte: number;
+
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20 && index < encoded.length);
+
+    const deltaLat = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
+    lat += deltaLat;
+
+    result = 0;
+    shift = 0;
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20 && index < encoded.length);
+
+    const deltaLng = (result & 1) !== 0 ? ~(result >> 1) : result >> 1;
+    lng += deltaLng;
+
+    points.push([lat / 1e5, lng / 1e5]);
+  }
+
+  return points;
+}
+
+function haversineMeters(a: LatLng, b: LatLng) {
+  const R = 6371000;
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const dLat = toRad(b[0] - a[0]);
+  const dLng = toRad(b[1] - a[1]);
+  const lat1 = toRad(a[0]);
+  const lat2 = toRad(b[0]);
+  const sinDlat = Math.sin(dLat / 2);
+  const sinDlng = Math.sin(dLng / 2);
+  const h = sinDlat * sinDlat + Math.cos(lat1) * Math.cos(lat2) * sinDlng * sinDlng;
+  return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+function formatDistance(meters: number) {
+  return meters >= 1000 ? `${(meters / 1000).toFixed(1)} km` : `${Math.round(meters)} m`;
+}
+
+function formatDuration(seconds: number) {
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return mins ? `${hours}h ${mins}m` : `${hours}h`;
+}
+
+function ResidentRouteMap({
+  incident,
+  routes,
+  responderNames,
+}: {
+  incident: { lat: number; lng: number };
+  routes: ResponderRouteRow[];
+  responderNames: ResponderNameDirectory;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<google.maps.Map | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!containerRef.current || mapRef.current) {
+      return;
+    }
+
+    void loadGoogleMapsApi().then(() => {
+      if (cancelled || !containerRef.current) {
+        return;
+      }
+
+      mapRef.current = new google.maps.Map(containerRef.current, {
+        center: { lat: incident.lat, lng: incident.lng },
+        zoom: 13,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+        gestureHandling: "greedy",
+        mapId: import.meta.env.VITE_GOOGLE_MAP_ID || "DEMO_MAP_ID",
+      });
+    }).catch(() => {
+      // Parent UI already shows route fallback info.
+    });
+
+    return () => {
+      cancelled = true;
+      mapRef.current = null;
+    };
+  }, [incident.lat, incident.lng]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) {
+      return;
+    }
+
+    const incidentMarker = new google.maps.Marker({
+      map,
+      position: { lat: incident.lat, lng: incident.lng },
+      title: "Incident location",
+      zIndex: 900,
+      icon: {
+        path: google.maps.SymbolPath.CIRCLE,
+        fillColor: "#ef4444",
+        fillOpacity: 1,
+        strokeColor: "#ffffff",
+        strokeWeight: 3,
+        scale: 9,
+      },
+    });
+
+    const routePolylines: google.maps.Polyline[] = [];
+    const responderMarkers: google.maps.Marker[] = [];
+    const bounds = new google.maps.LatLngBounds();
+    bounds.extend({ lat: incident.lat, lng: incident.lng });
+
+    routes.forEach((route) => {
+      const responderMarker = new google.maps.Marker({
+        map,
+        position: { lat: route.lat, lng: route.lng },
+        title: responderNames.get(route.uid) || "Assigned responder",
+        zIndex: 850,
+        icon: {
+          path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
+          fillColor: "#2563eb",
+          fillOpacity: 1,
+          strokeColor: "#ffffff",
+          strokeWeight: 2,
+          scale: 6,
+        },
+      });
+      responderMarkers.push(responderMarker);
+      bounds.extend({ lat: route.lat, lng: route.lng });
+
+      const polylinePoints = route.points.length ? route.points : [[route.lat, route.lng], [incident.lat, incident.lng]];
+      polylinePoints.forEach((point) => bounds.extend({ lat: point[0], lng: point[1] }));
+
+      const polyline = new google.maps.Polyline({
+        map,
+        path: polylinePoints.map((point) => ({ lat: point[0], lng: point[1] })),
+        strokeColor: "#2563eb",
+        strokeOpacity: 0.9,
+        strokeWeight: 5,
+        zIndex: 500,
+      });
+      routePolylines.push(polyline);
+    });
+
+    map.fitBounds(bounds, 56);
+
+    return () => {
+      incidentMarker.setMap(null);
+      responderMarkers.forEach((marker) => marker.setMap(null));
+      routePolylines.forEach((polyline) => polyline.setMap(null));
+    };
+  }, [incident.lat, incident.lng, responderNames, routes]);
+
+  return <div ref={containerRef} className="h-full w-full" />;
+}
 
 function toDate(value: unknown): Date | null {
   if (value instanceof Timestamp) return value.toDate();
@@ -65,6 +276,13 @@ export default function MyReports() {
     () => new Map()
   );
   const [responderNames, setResponderNames] = useState<ResponderNameDirectory>(() => new Map());
+  const [routeRows, setRouteRows] = useState<ResponderRouteRow[]>([]);
+  const [routeLoading, setRouteLoading] = useState(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
+  const [progressByResponder, setProgressByResponder] = useState<Map<string, RouteProgressState>>(
+    () => new Map()
+  );
+  const previousDistanceByResponderRef = useRef<Map<string, number>>(new Map());
 
   const selectedReport = useMemo(
     () => reports.find((report) => report.id === selectedReportId) || null,
@@ -212,6 +430,163 @@ export default function MyReports() {
     return Array.from(dedupedRows.values());
   }, [selectedReport?.assignedResponders, liveByResponderId]);
 
+  const shouldShowResidentTracking =
+    !!selectedReport &&
+    !!selectedReport.coordinates &&
+    (selectedReport.assignedResponders?.length || 0) > 0 &&
+    ["assigned", "en_route", "on_scene"].includes(selectedReport.status);
+
+  useEffect(() => {
+    if (!shouldShowResidentTracking || !selectedReport?.coordinates) {
+      setRouteRows([]);
+      setRouteLoading(false);
+      setRouteError(null);
+      setProgressByResponder(new Map());
+      previousDistanceByResponderRef.current.clear();
+      return;
+    }
+
+    if (responderLiveRows.length === 0) {
+      setRouteRows([]);
+      setRouteLoading(false);
+      setRouteError(null);
+      setProgressByResponder(new Map());
+      return;
+    }
+
+    let cancelled = false;
+    setRouteLoading(true);
+    setRouteError(null);
+
+    const incidentPoint: LatLng = [selectedReport.coordinates.lat, selectedReport.coordinates.lng];
+
+    const fetchRoutes = async () => {
+      const rows = await Promise.all(
+        responderLiveRows.map(async (live): Promise<ResponderRouteRow> => {
+          const fallbackDistance = haversineMeters([live.lat, live.lng], incidentPoint);
+          const fallbackDuration = Math.max(60, (fallbackDistance / 1000 / 35) * 3600);
+
+          if (!GOOGLE_MAPS_API_KEY) {
+            return {
+              uid: live.uid,
+              lat: live.lat,
+              lng: live.lng,
+              updatedAt: live.updatedAt,
+              points: [[live.lat, live.lng], incidentPoint],
+              distanceMeters: fallbackDistance,
+              durationSeconds: fallbackDuration,
+            };
+          }
+
+          try {
+            const response = await fetch("https://routes.googleapis.com/directions/v2:computeRoutes", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+                "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline",
+              },
+              body: JSON.stringify({
+                origin: {
+                  location: {
+                    latLng: { latitude: live.lat, longitude: live.lng },
+                  },
+                },
+                destination: {
+                  location: {
+                    latLng: {
+                      latitude: incidentPoint[0],
+                      longitude: incidentPoint[1],
+                    },
+                  },
+                },
+                travelMode: "DRIVE",
+                routingPreference: "TRAFFIC_AWARE_OPTIMAL",
+                computeAlternativeRoutes: false,
+                units: "METRIC",
+                regionCode: "PH",
+              }),
+            });
+
+            if (!response.ok) {
+              throw new Error(`Routes request failed (${response.status})`);
+            }
+
+            const result = (await response.json()) as GoogleRoutesApiResponse;
+            const route = result.routes?.[0];
+            const encoded = route?.polyline?.encodedPolyline;
+            const decodedPoints = encoded ? decodePolyline(encoded) : [[live.lat, live.lng], incidentPoint];
+
+            return {
+              uid: live.uid,
+              lat: live.lat,
+              lng: live.lng,
+              updatedAt: live.updatedAt,
+              points: decodedPoints,
+              distanceMeters: toNullableNumber(route?.distanceMeters) ?? fallbackDistance,
+              durationSeconds: parseDurationSeconds(route?.duration) ?? fallbackDuration,
+            };
+          } catch {
+            return {
+              uid: live.uid,
+              lat: live.lat,
+              lng: live.lng,
+              updatedAt: live.updatedAt,
+              points: [[live.lat, live.lng], incidentPoint],
+              distanceMeters: fallbackDistance,
+              durationSeconds: fallbackDuration,
+            };
+          }
+        })
+      );
+
+      if (cancelled) {
+        return;
+      }
+
+      setRouteRows(rows);
+      setRouteLoading(false);
+      if (!GOOGLE_MAPS_API_KEY) {
+        setRouteError("Google Maps key is missing. Showing approximate straight-line ETA.");
+      }
+    };
+
+    void fetchRoutes();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [responderLiveRows, selectedReport?.coordinates, shouldShowResidentTracking]);
+
+  useEffect(() => {
+    if (!selectedReport?.coordinates || routeRows.length === 0) {
+      setProgressByResponder(new Map());
+      return;
+    }
+
+    const next = new Map<string, RouteProgressState>();
+    const previousMap = previousDistanceByResponderRef.current;
+
+    routeRows.forEach((row) => {
+      const currentDistance = row.distanceMeters ?? haversineMeters([row.lat, row.lng], [selectedReport.coordinates!.lat, selectedReport.coordinates!.lng]);
+      const previousDistance = previousMap.get(row.uid);
+
+      if (currentDistance <= 180) {
+        next.set(row.uid, "near");
+      } else if (previousDistance !== undefined && currentDistance <= previousDistance - 20) {
+        next.set(row.uid, "approaching");
+      } else if (previousDistance !== undefined && currentDistance >= previousDistance + 20) {
+        next.set(row.uid, "moving_away");
+      } else {
+        next.set(row.uid, "en_route");
+      }
+
+      previousMap.set(row.uid, currentDistance);
+    });
+
+    setProgressByResponder(next);
+  }, [routeRows, selectedReport?.coordinates]);
+
   return (
     <div className="mx-auto max-w-lg bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)] px-4 pt-4 pb-24 animate-fade-in">
       <div className="mb-6 flex items-center gap-3 rounded-2xl border border-white/45 bg-white/45 px-3 py-3 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
@@ -256,7 +631,13 @@ export default function MyReports() {
 
                 <div className="flex items-center justify-between">
                   <CategoryIcon category={r.category} size={18} showLabel />
-                  <StatusBadge status={r.status} />
+                  {r.offlineSmsPending ? (
+                    <span className="inline-flex items-center rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold tracking-wide uppercase text-amber-800">
+                      Offline SMS
+                    </span>
+                  ) : (
+                    <StatusBadge status={r.status} />
+                  )}
                 </div>
                 {r.photoUrl && (
                   <img
@@ -300,7 +681,13 @@ export default function MyReports() {
 
               <div className="flex items-center justify-between">
                 <CategoryIcon category={selectedReport.category} size={18} showLabel />
-                <StatusBadge status={selectedReport.status} />
+                {selectedReport.offlineSmsPending ? (
+                  <span className="inline-flex items-center rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold tracking-wide uppercase text-amber-800">
+                    Offline SMS
+                  </span>
+                ) : (
+                  <StatusBadge status={selectedReport.status} />
+                )}
               </div>
 
               {selectedReport.photoUrl && (
@@ -332,6 +719,11 @@ export default function MyReports() {
                 <p>
                   Resolved At: <span className="font-semibold text-foreground">{selectedReport.resolvedAt ? selectedReport.resolvedAt.toLocaleString() : "Not yet"}</span>
                 </p>
+                {selectedReport.offlineSmsPending ? (
+                  <p className="col-span-2">
+                    SMS Target: <span className="font-semibold text-foreground">{selectedReport.smsNumber || "Unknown"}</span>
+                  </p>
+                ) : null}
               </div>
 
               {selectedReport.coordinates ? (
@@ -341,65 +733,62 @@ export default function MyReports() {
                     Responder Route to Incident
                   </div>
 
-                  {responderLiveRows.length === 0 ? (
+                  {!shouldShowResidentTracking ? (
+                    <p className="text-xs text-muted-foreground">
+                      Tracking appears when this report is active and has an assigned responder.
+                    </p>
+                  ) : responderLiveRows.length === 0 ? (
                     <p className="text-xs text-muted-foreground">
                       Waiting for assigned responder live location updates.
                     </p>
                   ) : (
                     <>
+                      {routeLoading ? (
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <Loader2 size={14} className="animate-spin" />
+                          Calculating responder route ETA...
+                        </div>
+                      ) : null}
+
+                      {routeError ? <p className="text-xs text-amber-700">{routeError}</p> : null}
+
                       <div className="h-56 overflow-hidden rounded-lg border">
-                        <MapContainer
-                          center={[selectedReport.coordinates.lat, selectedReport.coordinates.lng]}
-                          zoom={13}
-                          scrollWheelZoom
-                          className="h-full w-full"
-                        >
-                          <TileLayer
-                            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                            attribution="&copy; OpenStreetMap contributors"
-                          />
-
-                          <Marker position={[selectedReport.coordinates.lat, selectedReport.coordinates.lng]}>
-                            <Popup>Your incident location</Popup>
-                          </Marker>
-
-                          {responderLiveRows.map((live) => (
-                            <Marker key={live.uid} position={[live.lat, live.lng]}>
-                              <Popup>
-                                <div className="text-xs">
-                                  <p className="font-semibold">
-                                    {responderNames.get(live.uid) || "Assigned responder"}
-                                  </p>
-                                  <p>
-                                    Updated: {live.updatedAt ? live.updatedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Unknown"}
-                                  </p>
-                                </div>
-                              </Popup>
-                            </Marker>
-                          ))}
-
-                          {responderLiveRows.map((live) => (
-                            <Polyline
-                              key={`${live.uid}-route`}
-                              positions={[
-                                [live.lat, live.lng],
-                                [selectedReport.coordinates!.lat, selectedReport.coordinates!.lng],
-                              ]}
-                              pathOptions={{ color: "#0284c7", weight: 4, dashArray: "6 6" }}
-                            />
-                          ))}
-                        </MapContainer>
+                        <ResidentRouteMap
+                          incident={{ lat: selectedReport.coordinates.lat, lng: selectedReport.coordinates.lng }}
+                          routes={routeRows}
+                          responderNames={responderNames}
+                        />
                       </div>
 
                       <div className="space-y-1">
-                        {responderLiveRows.map((live) => (
-                          <div key={`${live.uid}-meta`} className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                        {routeRows.map((row) => {
+                          const progress = progressByResponder.get(row.uid) || "en_route";
+                          const progressLabel =
+                            progress === "near"
+                              ? "Near incident"
+                              : progress === "approaching"
+                                ? "Approaching"
+                                : progress === "moving_away"
+                                  ? "Moving away"
+                                  : "En route";
+
+                          return (
+                          <div key={`${row.uid}-meta`} className="flex items-center gap-2 text-[11px] text-muted-foreground">
                             <MapPin size={12} />
+                            <span className="font-semibold text-foreground">
+                              {responderNames.get(row.uid) || "Assigned responder"}
+                            </span>
                             <span>
-                              {responderNames.get(live.uid) || "Assigned responder"} at {live.lat.toFixed(5)}, {live.lng.toFixed(5)}
+                              ETA {row.durationSeconds !== null ? formatDuration(row.durationSeconds) : "N/A"}
+                            </span>
+                            <span>
+                              ({row.distanceMeters !== null ? formatDistance(row.distanceMeters) : "N/A"})
+                            </span>
+                            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-700">
+                              {progressLabel}
                             </span>
                           </div>
-                        ))}
+                        );})}
                       </div>
                     </>
                   )}

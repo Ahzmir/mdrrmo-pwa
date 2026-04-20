@@ -17,8 +17,20 @@ import { IncidentCategory } from "@/types/incident";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
 import { db } from "@/lib/firebase";
+import { loadGoogleMapsApi } from "@/lib/googleMaps";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { addDoc, collection, doc, getDoc, getDocFromServer, serverTimestamp } from "firebase/firestore";
-import { uploadImageToCloudinary } from "@/lib/cloudinary";
+import { uploadImageToFirebaseStorage } from "@/lib/storageUpload";
+import { addOfflineSmsReport } from "@/lib/offlineSmsReports";
 import { toast } from "sonner";
 
 const categories: { id: IncidentCategory; icon: typeof Flame; label: string; color: string }[] = [
@@ -62,11 +74,21 @@ export default function ReportForm() {
   const navigate = useNavigate();
   const fileRef = useRef<HTMLInputElement>(null);
   const watchIdRef = useRef<number | null>(null);
+  const manualMapContainerRef = useRef<HTMLDivElement | null>(null);
+  const manualMapRef = useRef<google.maps.Map | null>(null);
+  const manualMarkerRef = useRef<google.maps.Marker | null>(null);
+  const manualMapClickListenerRef = useRef<google.maps.MapsEventListener | null>(null);
+  const manualMarkerDragListenerRef = useRef<google.maps.MapsEventListener | null>(null);
 
   const [category, setCategory] = useState<IncidentCategory | null>(null);
   const [description, setDescription] = useState("");
   const [location, setLocation] = useState("");
   const [coordinates, setCoordinates] = useState<{ lat: number; lng: number } | null>(null);
+  const [locationMode, setLocationMode] = useState<"gps" | "manual">("gps");
+  const [manualLat, setManualLat] = useState("");
+  const [manualLng, setManualLng] = useState("");
+  const [manualMapReady, setManualMapReady] = useState(false);
+  const [manualMapError, setManualMapError] = useState<string | null>(null);
   const [locating, setLocating] = useState(false);
   const [locationError, setLocationError] = useState<string | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
@@ -84,11 +106,12 @@ export default function ReportForm() {
   const [forceOfflineMode, setForceOfflineMode] = useState(false);
   const [smsPreviewOpen, setSmsPreviewOpen] = useState(false);
   const [smsDraft, setSmsDraft] = useState("");
+  const [submitConfirmOpen, setSubmitConfirmOpen] = useState(false);
   const firebaseProjectId = (import.meta.env.VITE_FIREBASE_PROJECT_ID as string | undefined) || "(missing-project-id)";
 
   const effectiveOffline = offline || forceOfflineMode;
 
-  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "911-TEXT";
+  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "+16624902852";
 
   useEffect(() => {
     const handleOnline = () => setOffline(false);
@@ -150,6 +173,24 @@ export default function ReportForm() {
 
     setSmsDraft(message);
     setSmsPreviewOpen(true);
+  }
+
+  function saveOfflineSmsHistory(message: string) {
+    if (!user || user.role !== "resident" || !category || !coordinates) {
+      return;
+    }
+
+    addOfflineSmsReport({
+      id: `offline-sms-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      residentId: user.id,
+      category,
+      description: description.trim(),
+      location,
+      coordinates,
+      createdAtIso: new Date().toISOString(),
+      smsNumber: smsFallbackNumber,
+      smsBody: message,
+    });
   }
 
   useEffect(() => {
@@ -240,6 +281,7 @@ export default function ReportForm() {
       return;
     }
 
+    setLocationMode("gps");
     setLocating(true);
     setLocationError(null);
 
@@ -249,6 +291,8 @@ export default function ReportForm() {
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
         });
+        setManualLat("");
+        setManualLng("");
         setLocation(`${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}`);
         setLocating(false);
       },
@@ -260,8 +304,27 @@ export default function ReportForm() {
     );
   }
 
+  function setManualPin(lat: number, lng: number) {
+    setLocationMode("manual");
+    setCoordinates({ lat, lng });
+    setManualLat(lat.toFixed(6));
+    setManualLng(lng.toFixed(6));
+    setLocation(`${lat.toFixed(5)}, ${lng.toFixed(5)} (manual pin)`);
+    setLocationError(null);
+    setSubmitError(null);
+  }
+
   useEffect(() => {
     if (!verificationChecked || !isResidentVerified) {
+      return;
+    }
+
+    if (locationMode === "manual") {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+      setLocating(false);
       return;
     }
 
@@ -284,6 +347,8 @@ export default function ReportForm() {
           lat: pos.coords.latitude,
           lng: pos.coords.longitude,
         });
+        setManualLat("");
+        setManualLng("");
         setLocation(`${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}`);
         setLocating(false);
         setLocationError(null);
@@ -304,7 +369,138 @@ export default function ReportForm() {
         navigator.geolocation.clearWatch(watchIdRef.current);
       }
     };
-  }, [verificationChecked, isResidentVerified]);
+  }, [verificationChecked, isResidentVerified, locationMode]);
+
+  useEffect(() => {
+    if (locationMode !== "manual") {
+      return;
+    }
+
+    let cancelled = false;
+
+    void loadGoogleMapsApi()
+      .then(() => {
+        if (cancelled || !manualMapContainerRef.current) {
+          return;
+        }
+
+        const initialCenter = coordinates ?? { lat: 7.5, lng: 124.8 };
+
+        if (!manualMapRef.current) {
+          const map = new google.maps.Map(manualMapContainerRef.current, {
+            center: initialCenter,
+            zoom: coordinates ? 16 : 12,
+            mapTypeControl: false,
+            streetViewControl: false,
+            fullscreenControl: false,
+            clickableIcons: false,
+            gestureHandling: "greedy",
+            mapId: import.meta.env.VITE_GOOGLE_MAP_ID || "DEMO_MAP_ID",
+          });
+
+          manualMapRef.current = map;
+
+          manualMarkerRef.current = new google.maps.Marker({
+            map,
+            position: initialCenter,
+            draggable: true,
+            title: "Manual incident pin",
+          });
+
+          manualMapClickListenerRef.current = map.addListener("click", (event: google.maps.MapMouseEvent) => {
+            if (!event.latLng || !manualMarkerRef.current) {
+              return;
+            }
+
+            const lat = event.latLng.lat();
+            const lng = event.latLng.lng();
+            manualMarkerRef.current.setPosition({ lat, lng });
+            setManualPin(lat, lng);
+          });
+
+          manualMarkerDragListenerRef.current = manualMarkerRef.current.addListener("dragend", (event: google.maps.MapMouseEvent) => {
+            if (!event.latLng) {
+              return;
+            }
+
+            const lat = event.latLng.lat();
+            const lng = event.latLng.lng();
+            setManualPin(lat, lng);
+          });
+        }
+
+        if (manualMapRef.current) {
+          const target = coordinates ?? initialCenter;
+          manualMapRef.current.setCenter(target);
+          if (!coordinates) {
+            manualMapRef.current.setZoom(12);
+          }
+        }
+
+        if (manualMarkerRef.current && coordinates) {
+          manualMarkerRef.current.setPosition(coordinates);
+        }
+
+        setManualMapReady(true);
+        setManualMapError(null);
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        setManualMapReady(false);
+        const reason = (error as { message?: string }).message || "Unable to load Google Maps.";
+        setManualMapError(reason);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [locationMode, coordinates]);
+
+  useEffect(() => {
+    return () => {
+      manualMapClickListenerRef.current?.remove();
+      manualMapClickListenerRef.current = null;
+      manualMarkerDragListenerRef.current?.remove();
+      manualMarkerDragListenerRef.current = null;
+      if (manualMarkerRef.current) {
+        manualMarkerRef.current.setMap(null);
+      }
+      manualMarkerRef.current = null;
+      manualMapRef.current = null;
+      setManualMapReady(false);
+    };
+  }, []);
+
+  function applyManualPin() {
+    const lat = Number.parseFloat(manualLat.trim());
+    const lng = Number.parseFloat(manualLng.trim());
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      setLocationError("Enter valid latitude and longitude values.");
+      return;
+    }
+
+    if (lat < -90 || lat > 90) {
+      setLocationError("Latitude must be between -90 and 90.");
+      return;
+    }
+
+    if (lng < -180 || lng > 180) {
+      setLocationError("Longitude must be between -180 and 180.");
+      return;
+    }
+
+    setManualPin(lat, lng);
+    if (manualMapRef.current) {
+      manualMapRef.current.setCenter({ lat, lng });
+      manualMapRef.current.setZoom(16);
+    }
+    if (manualMarkerRef.current) {
+      manualMarkerRef.current.setPosition({ lat, lng });
+    }
+  }
 
   function handlePhoto(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -330,7 +526,14 @@ export default function ReportForm() {
 
     if (effectiveOffline) {
       setSubmitError(null);
-      openSmsFallbackPreview();
+      const smsMessage = buildSmsFallbackMessage();
+      if (!smsMessage) {
+        return;
+      }
+
+      saveOfflineSmsHistory(smsMessage);
+      launchSmsFallback(smsMessage);
+      setSubmitted(true);
       return;
     }
 
@@ -369,7 +572,7 @@ export default function ReportForm() {
     if (photoFile) {
       setUploadingPhoto(true);
       try {
-        uploadedPhotoUrl = await uploadImageToCloudinary(photoFile);
+        uploadedPhotoUrl = await uploadImageToFirebaseStorage(photoFile);
       } catch (error) {
         const message = (error as Error).message || "Unable to upload photo right now. Please try again.";
         setSubmitError(message);
@@ -441,6 +644,19 @@ export default function ReportForm() {
 
     setSubmitted(true);
     setIsSubmitting(false);
+  }
+
+  function openSubmitConfirmation() {
+    if (
+      !verificationChecked ||
+      !isResidentVerified ||
+      uploadingPhoto ||
+      isSubmitting
+    ) {
+      return;
+    }
+
+    setSubmitConfirmOpen(true);
   }
 
   if (submitted) {
@@ -544,6 +760,80 @@ export default function ReportForm() {
         <label className="text-xs font-bold text-muted-foreground uppercase tracking-wider mb-2 block">
           Location
         </label>
+        <div className="mb-2 grid grid-cols-2 gap-2">
+          <button
+            onClick={() => {
+              setLocationMode("gps");
+              setSubmitError(null);
+            }}
+            className={cn(
+              "rounded-lg border px-3 py-2 text-xs font-semibold transition-colors",
+              locationMode === "gps"
+                ? "border-orange-500 bg-orange-50 text-orange-700"
+                : "border-white/55 bg-white/60 text-foreground"
+            )}
+          >
+            GPS Pin
+          </button>
+          <button
+            onClick={() => {
+              setLocationMode("manual");
+              setLocating(false);
+              setLocationError(null);
+              setSubmitError(null);
+            }}
+            className={cn(
+              "rounded-lg border px-3 py-2 text-xs font-semibold transition-colors",
+              locationMode === "manual"
+                ? "border-orange-500 bg-orange-50 text-orange-700"
+                : "border-white/55 bg-white/60 text-foreground"
+            )}
+          >
+            Manual Pin
+          </button>
+        </div>
+
+        {locationMode === "manual" && (
+          <div className="mb-2 rounded-xl border border-white/55 bg-white/60 p-3 backdrop-blur-md">
+            <div className="mb-2">
+              <div ref={manualMapContainerRef} className="h-52 w-full rounded-lg border border-white/60 bg-muted/40" />
+              {!manualMapReady && !manualMapError ? (
+                <p className="mt-1 text-[11px] text-muted-foreground">Loading Google Maps...</p>
+              ) : null}
+              {manualMapError ? (
+                <p className="mt-1 text-[11px] text-destructive">
+                  {manualMapError} You can still pin manually using coordinates.
+                </p>
+              ) : (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Tap the map to drop a pin, then drag marker to fine-tune location.
+                </p>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                value={manualLat}
+                onChange={(event) => setManualLat(event.target.value)}
+                inputMode="decimal"
+                placeholder="Latitude"
+                className="rounded-lg border border-white/60 bg-white/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-warning/35"
+              />
+              <input
+                value={manualLng}
+                onChange={(event) => setManualLng(event.target.value)}
+                inputMode="decimal"
+                placeholder="Longitude"
+                className="rounded-lg border border-white/60 bg-white/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-warning/35"
+              />
+            </div>
+            <button
+              onClick={applyManualPin}
+              className="mt-2 rounded-lg border border-white/55 bg-white/70 px-3 py-2 text-xs font-semibold text-foreground"
+            >
+              Pin Coordinates
+            </button>
+          </div>
+        )}
         <div
           className={cn(
             "rounded-xl border bg-white/60 px-4 py-3 text-sm backdrop-blur-md transition-all duration-300",
@@ -557,7 +847,7 @@ export default function ReportForm() {
             <div className="flex items-center gap-2 min-w-0">
               <MapPin size={16} className={cn("shrink-0", location ? "text-success" : "text-muted-foreground")} />
               <p className={cn("truncate", location ? "text-foreground" : "text-muted-foreground")}>
-                {location || "Detecting your current location..."}
+                {location || (locationMode === "manual" ? "Enter coordinates and pin manually." : "Detecting your current location...")}
               </p>
             </div>
             <span
@@ -575,18 +865,18 @@ export default function ReportForm() {
         <div className="flex gap-2 mt-2">
           <button
             onClick={detectLocation}
-            disabled={locating}
+            disabled={locating || locationMode === "manual"}
             className="flex items-center gap-2 rounded-xl border border-white/55 bg-white/60 px-4 py-2 text-sm font-medium text-foreground backdrop-blur-md transition-all duration-200 disabled:opacity-60"
           >
             {locating ? <Loader2 size={18} className="animate-spin" /> : <MapPin size={18} />}
-            {locating ? "Updating..." : "Refresh"}
+            {locating ? "Updating..." : "Refresh GPS"}
           </button>
           {locationError ? (
             <p className="text-[11px] text-destructive animate-slide-up">{locationError}</p>
           ) : null}
         </div>
         <p className="text-[10px] text-muted-foreground mt-1 ml-1 animate-slide-up">
-          Location is detected automatically and stays synced to your current GPS position.
+          Use GPS Pin for automatic live location, or Manual Pin with Google Maps and coordinate fallback.
         </p>
       </div>
 
@@ -666,7 +956,7 @@ export default function ReportForm() {
         </p>
       )}
       <button
-        onClick={handleSubmit}
+        onClick={openSubmitConfirmation}
         disabled={
           !verificationChecked ||
           !isResidentVerified ||
@@ -701,6 +991,32 @@ export default function ReportForm() {
         )}
       </button>
       {submitError && <p className="mt-2 text-xs text-destructive">{submitError}</p>}
+
+      <AlertDialog open={submitConfirmOpen} onOpenChange={setSubmitConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {effectiveOffline ? "Send SMS report now?" : "Submit incident report now?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {effectiveOffline
+                ? "This will open your SMS app with the formatted incident details, including your pinned location."
+                : "Please confirm the report details are correct before sending to MDRRMO."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isSubmitting || uploadingPhoto}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isSubmitting || uploadingPhoto}
+              onClick={() => {
+                void handleSubmit();
+              }}
+            >
+              {effectiveOffline ? "Send via SMS" : "Submit Report"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {smsPreviewOpen && (
         <div className="fixed inset-0 z-[120] bg-foreground/40 backdrop-blur-sm px-4 py-6">

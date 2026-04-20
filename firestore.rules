@@ -11,7 +11,13 @@ service cloud.firestore {
 
     function isAdmin() {
       return isSignedIn()
-        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+        && (
+          exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+          || (
+            request.auth.token.email is string
+            && request.auth.token.email == "admin@mdrrmo.com"
+          )
+        );
     }
 
     function isApprovedResident(uid) {
@@ -42,26 +48,68 @@ service cloud.firestore {
 
     // Resident account profiles created during sign-up.
     match /residents/{uid} {
-      allow create: if isOwner(uid)
-        && request.resource.data.uid == request.auth.uid
-        && request.resource.data.role == "resident"
-        && request.resource.data.email is string
-        && request.resource.data.fullName is string
-        && request.resource.data.phone is string
-        && request.resource.data.address is string
-        && request.resource.data.barangay is string
-        && request.resource.data.city is string
-        && request.resource.data.validIdUrl is string
-        && request.resource.data.residencyProofUrl is string
-        && request.resource.data.idType is string
-        && request.resource.data.idNumber is string
-        && request.resource.data.verified == false
-        && request.resource.data.verificationStatus == "pending"
-        && request.resource.data.verifiedAt == null
-        && request.resource.data.rejectionReason == null;
+      allow create: if (
+          isOwner(uid)
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.role == "resident"
+          && request.resource.data.email is string
+          && request.resource.data.fullName is string
+          && request.resource.data.phone is string
+          && request.resource.data.address is string
+          && request.resource.data.barangay is string
+          && request.resource.data.city is string
+          && request.resource.data.validIdUrl is string
+          && request.resource.data.residencyProofUrl is string
+          && request.resource.data.idType is string
+          && request.resource.data.idNumber is string
+          && request.resource.data.verified == false
+          && request.resource.data.verificationStatus == "pending"
+          && request.resource.data.verifiedAt == null
+          && request.resource.data.rejectionReason == null
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.updatedAt is timestamp
+        ) || (
+          isAdmin()
+          && request.resource.data.uid == uid
+          && request.resource.data.role == "resident"
+          && request.resource.data.email is string
+          && request.resource.data.fullName is string
+          && request.resource.data.phone is string
+          && request.resource.data.address is string
+          && request.resource.data.barangay is string
+          && request.resource.data.city is string
+          && request.resource.data.validIdUrl is string
+          && request.resource.data.residencyProofUrl is string
+          && request.resource.data.idType is string
+          && request.resource.data.idNumber is string
+          && request.resource.data.verificationStatus in ["pending", "approved", "rejected"]
+          && (
+            (request.resource.data.verificationStatus == "approved"
+              && request.resource.data.verified == true
+              && request.resource.data.rejectionReason == null)
+            || (request.resource.data.verificationStatus != "approved"
+              && request.resource.data.verified == false)
+          )
+          && (
+            (request.resource.data.verificationStatus == "approved"
+              && request.resource.data.verifiedAt is timestamp)
+            || (request.resource.data.verificationStatus != "approved"
+              && request.resource.data.verifiedAt == null)
+          )
+          && (
+            (request.resource.data.verificationStatus == "rejected"
+              && request.resource.data.rejectionReason is string
+              && request.resource.data.rejectionReason.size() > 0
+              && request.resource.data.rejectionReason.size() <= 500)
+            || (request.resource.data.verificationStatus != "rejected"
+              && request.resource.data.rejectionReason == null)
+          )
+          && request.resource.data.createdAt is timestamp
+          && request.resource.data.updatedAt is timestamp
+        );
 
       allow read: if isOwner(uid) || isAdmin();
-      allow update: if (
+        allow update: if (
           isOwner(uid)
           && request.resource.data.uid == resource.data.uid
           && request.resource.data.role == "resident"
@@ -75,15 +123,15 @@ service cloud.firestore {
           && request.resource.data.uid == resource.data.uid
           && request.resource.data.role == resource.data.role
           && request.resource.data.email == resource.data.email
-          && request.resource.data.fullName == resource.data.fullName
-          && request.resource.data.phone == resource.data.phone
-          && request.resource.data.address == resource.data.address
-          && request.resource.data.barangay == resource.data.barangay
-          && request.resource.data.city == resource.data.city
-          && request.resource.data.validIdUrl == resource.data.validIdUrl
-          && request.resource.data.residencyProofUrl == resource.data.residencyProofUrl
-          && request.resource.data.idType == resource.data.idType
-          && request.resource.data.idNumber == resource.data.idNumber
+          && request.resource.data.fullName is string
+          && request.resource.data.phone is string
+          && request.resource.data.address is string
+          && request.resource.data.barangay is string
+          && request.resource.data.city is string
+          && request.resource.data.validIdUrl is string
+          && request.resource.data.residencyProofUrl is string
+          && request.resource.data.idType is string
+          && request.resource.data.idNumber is string
           && request.resource.data.verificationStatus in ["pending", "approved", "rejected"]
           && (
             (request.resource.data.verificationStatus == "approved"
@@ -100,6 +148,14 @@ service cloud.firestore {
             || (request.resource.data.verificationStatus != "rejected"
               && request.resource.data.rejectionReason == null)
           )
+          && (
+            (request.resource.data.verificationStatus == "approved"
+              && request.resource.data.verifiedAt is timestamp)
+            || (request.resource.data.verificationStatus != "approved"
+              && request.resource.data.verifiedAt == null)
+          )
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.updatedAt is timestamp
         );
       allow delete: if isAdmin();
     }

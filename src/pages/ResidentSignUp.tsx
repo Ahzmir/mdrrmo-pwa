@@ -13,7 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ArrowLeft, BadgeCheck, Check, ChevronDown, Loader2, ShieldCheck, Upload } from "lucide-react";
-import { uploadFileToCloudinary } from "@/lib/cloudinary";
+import { uploadFileToFirebaseStorage } from "@/lib/storageUpload";
 
 type RegistrationForm = {
   fullName: string;
@@ -137,8 +137,8 @@ export default function ResidentSignUp() {
     try {
       setUploadingVerification(true);
       const [validIdUrl, residencyProofUrl] = await Promise.all([
-        uploadFileToCloudinary(validIdPhoto),
-        uploadFileToCloudinary(residencyProof),
+        uploadFileToFirebaseStorage(validIdPhoto),
+        uploadFileToFirebaseStorage(residencyProof),
       ]);
 
       await registerResident({

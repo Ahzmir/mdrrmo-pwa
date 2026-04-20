@@ -3,6 +3,16 @@ import { useNavigate } from "react-router-dom";
 import { ArrowLeft, Loader2, LogOut, Save, Settings as SettingsIcon } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { auth, db } from "@/lib/firebase";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   EmailAuthProvider,
@@ -56,6 +66,7 @@ export default function ResponderSettings() {
   const navigate = useNavigate();
   const { user, logout } = useAuth();
   const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
   const [profile, setProfile] = useState<ResponderProfile>({
     name: "",
     phone: "",
@@ -345,13 +356,35 @@ export default function ResponderSettings() {
 
         <button
           type="button"
-          onClick={() => void handleLogout()}
+          onClick={() => setLogoutConfirmOpen(true)}
           disabled={loggingOut}
           className="flex w-full items-center justify-center gap-2 rounded-xl bg-orange-600 px-4 py-3 text-sm font-semibold text-white transition-transform active:scale-[0.98] disabled:opacity-70"
         >
           <LogOut size={16} />
           {loggingOut ? "Signing out..." : "Sign Out"}
         </button>
+
+        <AlertDialog open={logoutConfirmOpen} onOpenChange={setLogoutConfirmOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Sign out now?</AlertDialogTitle>
+              <AlertDialogDescription>
+                You will need to sign in again before receiving updates and handling incidents.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={loggingOut}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                disabled={loggingOut}
+                onClick={() => {
+                  void handleLogout();
+                }}
+              >
+                Sign Out
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
 
       <Dialog

@@ -18,12 +18,14 @@ import {
 import { auth, db } from "@/lib/firebase";
 
 export type UserRole = "resident" | "responder";
+export type ResponderUnit = "police" | "medic" | "disaster";
 
 export interface AuthUser {
   id: string;
   name: string;
   email: string;
   role: UserRole;
+  responderUnit?: ResponderUnit;
 }
 
 export interface ResidentRegistrationInput {
@@ -53,6 +55,53 @@ interface ResponderProfileDoc {
   role?: string;
   name?: string;
   email?: string;
+  type?: string;
+  responderType?: string;
+  unit?: string;
+  team?: string;
+  department?: string;
+  specialization?: string;
+}
+
+function toResponderUnit(value: unknown): ResponderUnit | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized.includes("police") || normalized.includes("crime") || normalized.includes("law")) {
+    return "police";
+  }
+
+  if (normalized.includes("medic") || normalized.includes("medical") || normalized.includes("health")) {
+    return "medic";
+  }
+
+  if (
+    normalized.includes("disaster") ||
+    normalized.includes("rescue") ||
+    normalized.includes("emergency") ||
+    normalized.includes("fire")
+  ) {
+    return "disaster";
+  }
+
+  return undefined;
+}
+
+function inferResponderUnit(profile: ResponderProfileDoc): ResponderUnit | undefined {
+  return (
+    toResponderUnit(profile.type) ||
+    toResponderUnit(profile.responderType) ||
+    toResponderUnit(profile.unit) ||
+    toResponderUnit(profile.team) ||
+    toResponderUnit(profile.department) ||
+    toResponderUnit(profile.specialization)
+  );
 }
 
 interface AuthContextType {
@@ -121,6 +170,7 @@ function toResponderUser(uid: string, profile: ResponderProfileDoc, fallbackEmai
     name: profile.name || "Responder",
     email: profile.email || fallbackEmail || "",
     role: "responder",
+    responderUnit: inferResponderUnit(profile),
   };
 }
 
@@ -177,19 +227,33 @@ async function updateResponderLiveLocation(
   longitude: number,
   accuracy: number | null
 ) {
+  const liveLocationPayload = {
+    latitude,
+    longitude,
+    lat: latitude,
+    lng: longitude,
+    accuracy,
+  };
+
   const responderLocationRef = doc(db, "responderLiveLocations", uid);
-  await setDoc(responderLocationRef, {
+  const responderRef = doc(db, "responders", uid);
+
+  const liveCollectionWrite = setDoc(responderLocationRef, {
     uid,
-    liveLocation: {
-      latitude,
-      longitude,
-      lat: latitude,
-      lng: longitude,
-      accuracy,
-    },
+    liveLocation: liveLocationPayload,
     liveLocationUpdatedAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   }, { merge: true });
+
+  const responderDocWrite = updateDoc(responderRef, {
+    sessionActive: true,
+    sessionLastSeenAt: serverTimestamp(),
+    liveLocation: liveLocationPayload,
+    liveLocationUpdatedAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+
+  await Promise.allSettled([liveCollectionWrite, responderDocWrite]);
 }
 
 async function updateResidentLiveLocation(
@@ -239,6 +303,31 @@ async function endResponderSession(uid: string) {
     sessionEndedAt: serverTimestamp(),
     sessionLastSeenAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
+  });
+}
+
+async function captureCurrentPosition() {
+  if (typeof window === "undefined" || !navigator.geolocation) {
+    return null;
+  }
+
+  return new Promise<{ lat: number; lng: number; accuracy: number | null } | null>((resolve) => {
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const accuracy = Number.isFinite(position.coords.accuracy) ? position.coords.accuracy : null;
+        resolve({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+          accuracy,
+        });
+      },
+      () => resolve(null),
+      {
+        enableHighAccuracy: true,
+        timeout: 2000,
+        maximumAge: 5000,
+      }
+    );
   });
 }
 
@@ -751,8 +840,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const currentUid = auth.currentUser?.uid;
       if (user?.role === "responder" && currentUid) {
+        // Best-effort final location sync before ending session/sign-out.
+        try {
+          const finalLocation = await captureCurrentPosition();
+          if (finalLocation) {
+            await updateResponderLiveLocation(
+              currentUid,
+              finalLocation.lat,
+              finalLocation.lng,
+              finalLocation.accuracy
+            );
+          }
+        } catch {
+          // Ignore best-effort final location sync failures.
+        }
+
         // Best-effort session end write: never block sign-out on network/rules issues.
-        void endResponderSession(currentUid).catch(() => undefined);
+        await endResponderSession(currentUid).catch(() => undefined);
       }
 
       await signOut(auth).catch(() => undefined);

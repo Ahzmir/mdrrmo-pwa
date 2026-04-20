@@ -1,12 +1,48 @@
 let googleMapsApiPromise: Promise<typeof google.maps> | null = null;
 
+async function ensureMapsReady(): Promise<typeof google.maps> {
+  const timeoutAt = Date.now() + 10000;
+
+  while (Date.now() < timeoutAt) {
+    const maps = window.google?.maps;
+    if (!maps) {
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 100);
+      });
+      continue;
+    }
+
+    if (typeof maps.Map === "function") {
+      return maps;
+    }
+
+    if (typeof maps.importLibrary === "function") {
+      try {
+        await maps.importLibrary("maps");
+      } catch {
+        // Retry until timeout to handle transient script initialization states.
+      }
+
+      if (typeof maps.Map === "function") {
+        return maps;
+      }
+    }
+
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 100);
+    });
+  }
+
+  throw new Error("Google Maps Map constructor is unavailable.");
+}
+
 export function loadGoogleMapsApi(): Promise<typeof google.maps> {
   if (typeof window === "undefined") {
     return Promise.reject(new Error("Google Maps is only available in the browser."));
   }
 
   if (window.google?.maps) {
-    return Promise.resolve(window.google.maps);
+    return ensureMapsReady();
   }
 
   if (googleMapsApiPromise) {
@@ -21,12 +57,13 @@ export function loadGoogleMapsApi(): Promise<typeof google.maps> {
   googleMapsApiPromise = new Promise<typeof google.maps>((resolve, reject) => {
     const existingScript = document.getElementById("google-maps-js");
     if (existingScript) {
+      if (window.google?.maps) {
+        void ensureMapsReady().then(resolve).catch(reject);
+        return;
+      }
+
       existingScript.addEventListener("load", () => {
-        if (window.google?.maps) {
-          resolve(window.google.maps);
-          return;
-        }
-        reject(new Error("Google Maps script loaded without maps namespace."));
+        void ensureMapsReady().then(resolve).catch(reject);
       });
       existingScript.addEventListener("error", () => {
         reject(new Error("Failed to load Google Maps script."));
@@ -38,14 +75,10 @@ export function loadGoogleMapsApi(): Promise<typeof google.maps> {
     script.id = "google-maps-js";
     script.async = true;
     script.defer = true;
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&v=weekly`;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&v=weekly&libraries=marker,routes`;
 
     script.onload = () => {
-      if (window.google?.maps) {
-        resolve(window.google.maps);
-        return;
-      }
-      reject(new Error("Google Maps script loaded without maps namespace."));
+      void ensureMapsReady().then(resolve).catch(reject);
     };
 
     script.onerror = () => {

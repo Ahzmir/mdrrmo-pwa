@@ -9,6 +9,7 @@ import {
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/contexts/AuthContext";
 import { IncidentReport, IncidentCategory, ReportStatus } from "@/types/incident";
+import { getOfflineSmsReportsByResident, subscribeOfflineSmsReports } from "@/lib/offlineSmsReports";
 
 function toDate(value: unknown): Date | null {
   if (value instanceof Timestamp) return value.toDate();
@@ -46,6 +47,37 @@ function normalizeReportStatus(value: unknown): ReportStatus {
 export function useReports() {
   const { user } = useAuth();
   const [reports, setReports] = useState<IncidentReport[]>([]);
+  const [offlineReports, setOfflineReports] = useState<IncidentReport[]>([]);
+
+  useEffect(() => {
+    if (!user || user.role !== "resident") {
+      setOfflineReports([]);
+      return;
+    }
+
+    const loadOfflineReports = () => {
+      const rows = getOfflineSmsReportsByResident(user.id).map((entry) => ({
+        id: entry.id,
+        category: entry.category as IncidentCategory,
+        description: entry.description,
+        location: entry.location,
+        coordinates: entry.coordinates,
+        status: "pending" as ReportStatus,
+        createdAt: new Date(entry.createdAtIso),
+        updatedAt: new Date(entry.createdAtIso),
+        source: "offline_sms",
+        offlineSmsPending: true,
+        smsNumber: entry.smsNumber,
+      } satisfies IncidentReport));
+
+      rows.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      setOfflineReports(rows);
+    };
+
+    loadOfflineReports();
+    const unsubscribe = subscribeOfflineSmsReports(loadOfflineReports);
+    return () => unsubscribe();
+  }, [user]);
 
   useEffect(() => {
     if (!user || user.role !== "resident") {
@@ -113,5 +145,5 @@ export function useReports() {
     return () => unsubscribe();
   }, [user]);
 
-  return reports;
+  return [...reports, ...offlineReports].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 }

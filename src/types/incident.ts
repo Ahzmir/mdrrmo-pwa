@@ -22,5 +22,8 @@ export interface IncidentReport {
   updatedAt?: Date | null;
   responderAssignmentStatus?: "assigned" | "accepted" | "rejected";
   responderAssignmentReason?: string;
+  source?: "web" | "offline_sms";
+  offlineSmsPending?: boolean;
+  smsNumber?: string;
   createdAt: Date;
 }

@@ -86,6 +86,41 @@ function toStatus(value: unknown): ReportStatus {
   return "pending";
 }
 
+function toFiniteNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function normalizeCoordinates(rawLat: unknown, rawLng: unknown): { lat: number; lng: number } | null {
+  const lat = toFiniteNumber(rawLat);
+  const lng = toFiniteNumber(rawLng);
+
+  if (lat === null || lng === null) {
+    return null;
+  }
+
+  if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+    return { lat, lng };
+  }
+
+  // Recover records where lat/lng were accidentally stored in swapped fields.
+  if (Math.abs(lng) <= 90 && Math.abs(lat) <= 180) {
+    return { lat: lng, lng: lat };
+  }
+
+  return null;
+}
+
 export function useIncidents() {
   const { user } = useAuth();
   const [incidents, setIncidents] = useState<IncidentReport[]>([]);
@@ -107,8 +142,7 @@ export function useIncidents() {
     const snapshotsByKey = new Map<string, Map<string, IncidentReport>>();
 
     const toIncidentReport = (incidentId: string, data: Record<string, unknown>): IncidentReport => {
-      const lat = typeof data.lat === "number" ? data.lat : null;
-      const lng = typeof data.lng === "number" ? data.lng : null;
+      const normalizedCoordinates = normalizeCoordinates(data.lat, data.lng);
       const responses =
         data.responderResponses && typeof data.responderResponses === "object" && !Array.isArray(data.responderResponses)
           ? (data.responderResponses as Record<string, unknown>)
@@ -131,7 +165,7 @@ export function useIncidents() {
         category: toCategory(data.category),
         description: (data.description as string) || "No description provided.",
         location: (data.location as string) || "",
-        coordinates: lat !== null && lng !== null ? { lat, lng } : undefined,
+        coordinates: normalizedCoordinates ?? undefined,
         photoUrl: typeof data.photoUrl === "string" ? data.photoUrl : undefined,
         status: toStatus(data.status),
         responderAssignmentStatus,
