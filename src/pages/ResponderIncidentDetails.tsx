@@ -1290,7 +1290,7 @@ export default function ResponderIncidentDetails() {
               distance: toNullableNumber(route.distanceMeters),
               duration: parseDurationSeconds(route.duration),
               instructions,
-              source: "google",
+              source: "google" as const,
             };
           })
           .filter((route) => route.points.length > 0);

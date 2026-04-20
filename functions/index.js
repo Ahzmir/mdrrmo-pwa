@@ -1,15 +1,15 @@
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
-const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { defineSecret } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const crypto = require("node:crypto");
 const admin = require("firebase-admin");
 
-const SEMAPHORE_MESSAGES_ENDPOINT = "https://api.semaphore.co/api/v4/messages";
-const DEFAULT_SEMAPHORE_SENDERNAME = "MDRRMO";
-const semaphoreApiKeySecret = defineSecret("SEMAPHORE_API_KEY");
-const smsFallbackNumberSecret = defineSecret("SMS_FALLBACK_NUMBER");
+const { sendSmsMobileApi } = require("./smsmobileapi");
+
+// smsmobileapi migration constants
+const SMSMOBILEAPI_API_KEY = "8e82949f466e58ed578ff58a38038bc0b82881aaefb85540";
+const SMSMOBILEAPI_DESTINATION = "+639177044103";
 const simInboundTokenSecret = defineSecret("SIM_INBOUND_TOKEN");
 
 admin.initializeApp();
@@ -451,61 +451,8 @@ async function assertResidentCaller(request) {
   };
 }
 
-function readSemaphoreConfig() {
-  let apiKey = "";
-  let destination = "";
 
-  try {
-    const secretValue = semaphoreApiKeySecret.value();
-    if (typeof secretValue === "string") {
-      apiKey = secretValue.trim();
-    }
-  } catch {
-    apiKey = "";
-  }
-
-  try {
-    const secretValue = smsFallbackNumberSecret.value();
-    if (typeof secretValue === "string") {
-      destination = secretValue.trim();
-    }
-  } catch {
-    destination = "";
-  }
-
-  if (!apiKey && typeof process.env.SEMAPHORE_API_KEY === "string") {
-    apiKey = process.env.SEMAPHORE_API_KEY.trim();
-  }
-
-  if (!destination && typeof process.env.SMS_FALLBACK_NUMBER === "string") {
-    destination = process.env.SMS_FALLBACK_NUMBER.trim();
-  }
-
-  const senderNameRaw =
-    typeof process.env.SEMAPHORE_SENDERNAME === "string"
-      ? process.env.SEMAPHORE_SENDERNAME.trim()
-      : "";
-
-  if (!apiKey) {
-    throw new HttpsError(
-      "failed-precondition",
-      "SEMAPHORE_API_KEY is not configured in Cloud Functions."
-    );
-  }
-
-  if (!destination) {
-    throw new HttpsError(
-      "failed-precondition",
-      "SMS_FALLBACK_NUMBER is not configured in Cloud Functions."
-    );
-  }
-
-  return {
-    apiKey,
-    destination,
-    senderName: senderNameRaw || DEFAULT_SEMAPHORE_SENDERNAME,
-  };
-}
+// No-op: readSemaphoreConfig removed for smsmobileapi migration
 
 function readSimInboundToken() {
   let token = "";
@@ -530,43 +477,8 @@ function readSimInboundToken() {
   return token;
 }
 
-async function sendSmsSemaphore({ apiKey, destination, message, senderName }) {
-  const payload = new URLSearchParams();
-  payload.set("apikey", apiKey);
-  payload.set("number", destination);
-  payload.set("message", message);
-  if (senderName) {
-    payload.set("sendername", senderName);
-  }
 
-  const response = await fetch(SEMAPHORE_MESSAGES_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Accept": "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: payload.toString(),
-  });
-
-  let responseBody = null;
-  try {
-    responseBody = await response.json();
-  } catch {
-    responseBody = null;
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `Semaphore API request failed with status ${response.status}: ${JSON.stringify(responseBody)}`
-    );
-  }
-
-  if (!Array.isArray(responseBody)) {
-    throw new Error("Semaphore API response was not an array.");
-  }
-
-  return responseBody;
-}
+// sendSmsSemaphore removed for smsmobileapi migration
 
 async function assertAdminCaller(request) {
   if (!request.auth?.uid) {
@@ -774,39 +686,25 @@ exports.deleteResidentAccount = onCall(async (request) => {
   };
 });
 
-exports.submitSmsFallbackReport = onCall({
-  secrets: [semaphoreApiKeySecret, smsFallbackNumberSecret],
-}, async (request) => {
+exports.submitSmsFallbackReport = onCall(async (request) => {
   const resident = await assertResidentCaller(request);
   const payload = parseSmsFallbackPayload(request.data);
-  const semaphoreConfig = readSemaphoreConfig();
 
   try {
-    const semaphoreResponse = await sendSmsSemaphore({
-      apiKey: semaphoreConfig.apiKey,
-      destination: semaphoreConfig.destination,
+    const smsmobileResponse = await sendSmsMobileApi({
+      apiKey: SMSMOBILEAPI_API_KEY,
+      destination: SMSMOBILEAPI_DESTINATION,
       message: payload.smsBody,
-      senderName: semaphoreConfig.senderName,
     });
-
-    const semaphoreMessageIds = semaphoreResponse
-      .map((row) => {
-        const idValue = row && typeof row === "object" ? row.message_id : null;
-        if (typeof idValue === "number" || typeof idValue === "string") {
-          return String(idValue);
-        }
-        return null;
-      })
-      .filter((value) => typeof value === "string");
 
     const senderIdentity = payload.reporterPhone || resident.phone || payload.reporterEmail || resident.email || resident.uid;
 
     await storeInboundSms({
       sender: senderIdentity,
       message: payload.smsBody,
-      source: "semaphore",
+      source: "smsmobileapi",
       extra: {
-        provider: "semaphore",
+        provider: "smsmobileapi",
         reportId: payload.reportId,
         residentUid: resident.uid,
         residentName: payload.reporterName || resident.name || "Resident",
@@ -815,57 +713,24 @@ exports.submitSmsFallbackReport = onCall({
         description: payload.description || "",
         coordinates: payload.coordinates,
         originalCreatedAtIso: payload.createdAtIso,
-        semaphoreMessageIds,
+        smsmobileResponse,
       },
     });
 
     return {
       ok: true,
-      destination: semaphoreConfig.destination,
-      provider: "semaphore",
-      semaphoreMessageIds,
+      destination: SMSMOBILEAPI_DESTINATION,
+      provider: "smsmobileapi",
+      smsmobileResponse,
     };
   } catch (error) {
-    logger.error("Failed to send SMS fallback via Semaphore", {
+    logger.error("Failed to send SMS fallback via smsmobileapi", {
       uid: request.auth?.uid || null,
       reportId: payload.reportId,
       message: error?.message,
     });
-    throw new HttpsError("internal", "Unable to send SMS fallback via Semaphore.");
+    throw new HttpsError("internal", "Unable to send SMS fallback via smsmobileapi.");
   }
-});
-
-exports.convertIncomingSmsToIncident = onDocumentCreated("incoming_sms/{smsId}", async (event) => {
-  const smsId = event.params?.smsId;
-  const snapshot = event.data;
-  if (!snapshot || !smsId) {
-    return;
-  }
-
-  const data = snapshot.data() || {};
-  const existingIncidentId = toTrimmedString(data.incidentId);
-  if (data.converted === true && existingIncidentId) {
-    return;
-  }
-
-  const incidentRef = db.collection("incidents").doc(`sms-${smsId}`);
-  const incidentSnap = await incidentRef.get();
-  if (!incidentSnap.exists) {
-    const incidentPayload = buildIncidentFromInboundSms({ smsId, data });
-    await incidentRef.set(incidentPayload);
-  }
-
-  const conversionPayload = {
-    converted: true,
-    convertedAt: admin.firestore.FieldValue.serverTimestamp(),
-    incidentId: incidentRef.id,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  };
-
-  await Promise.all([
-    snapshot.ref.set(conversionPayload, { merge: true }),
-    db.collection("smsInbox").doc(smsId).update(conversionPayload).catch(() => undefined),
-  ]);
 });
 
 exports.twilioInboundSms = onRequest(async (req, res) => {

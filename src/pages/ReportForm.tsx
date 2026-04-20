@@ -115,7 +115,7 @@ export default function ReportForm() {
 
   const effectiveOffline = offline || forceOfflineMode;
 
-  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "09067807028";
+  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "+639177044103";
 
   function categoryToSmsLabel(value: IncidentCategory) {
     if (value === "fire") return "FIRE";
@@ -203,12 +203,15 @@ export default function ReportForm() {
         reporterEmail: user.email,
       });
 
-      markOfflineSmsReportSent(entry.id, result.semaphoreMessageIds[0] || null);
+      const firstGatewayMessageId = Array.isArray(result.semaphoreMessageIds)
+        ? result.semaphoreMessageIds[0] || null
+        : null;
+      markOfflineSmsReportSent(entry.id, firstGatewayMessageId);
       return true;
     } catch (error) {
       const message =
         (error as { message?: string })?.message ||
-        "Unable to sync SMS fallback with Semaphore.";
+        "Unable to sync SMS fallback with SMS gateway.";
       markOfflineSmsReportFailed(entry.id, message);
       return false;
     }
@@ -607,11 +610,11 @@ export default function ReportForm() {
         return;
       }
 
-      const sentViaSemaphore = await syncOfflineSmsEntry(queuedEntry);
-      if (sentViaSemaphore) {
-        toast.success("Report sent via Semaphore SMS fallback.");
+      const sentViaGateway = await syncOfflineSmsEntry(queuedEntry);
+      if (sentViaGateway) {
+        toast.success("Report sent via SMS fallback gateway.");
       } else {
-        toast.warning("Semaphore send failed. Opening your SMS app as backup.");
+        toast.warning("Gateway send failed. Opening your SMS app as backup.");
         launchSmsFallback(smsMessage);
       }
 
@@ -1028,7 +1031,7 @@ export default function ReportForm() {
       {effectiveOffline && (
         <div className="mb-3 rounded-xl border-2 border-dashed border-warning bg-warning-light px-3 py-2">
           <p className="text-xs font-semibold text-warning-foreground">
-            SMS fallback mode is active. If internet is offline, your SMS app opens for immediate send to {smsFallbackNumber}. If SMS cannot send (e.g., no load), this report stays queued and auto-syncs via Semaphore once internet is back.
+            SMS fallback mode is active. If internet is offline, your SMS app opens for immediate send to {smsFallbackNumber}. If SMS cannot send (e.g., no load), this report stays queued and auto-syncs via SMS fallback gateway once internet is back.
           </p>
         </div>
       )}
@@ -1082,7 +1085,7 @@ export default function ReportForm() {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {effectiveOffline
-                ? "If online, this sends through Semaphore now. If offline, your SMS app opens for immediate send. If SMS fails (like no load), the report remains queued for auto-sync once internet returns."
+                ? "If online, this sends through the SMS fallback gateway now. If offline, your SMS app opens for immediate send. If SMS fails (like no load), the report remains queued for auto-sync once internet returns."
                 : "Please confirm the report details are correct before sending to MDRRMO."}
             </AlertDialogDescription>
           </AlertDialogHeader>

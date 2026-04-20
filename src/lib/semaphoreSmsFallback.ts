@@ -23,8 +23,9 @@ export interface SubmitSmsFallbackReportPayload {
 interface SubmitSmsFallbackReportResult {
   ok: boolean;
   destination: string;
-  provider: "semaphore";
-  semaphoreMessageIds: string[];
+  provider: "semaphore" | "smsmobileapi";
+  semaphoreMessageIds?: string[];
+  smsmobileResponse?: unknown;
 }
 
 const submitSmsFallbackReportCallable = httpsCallable<
