@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Route, Routes, Navigate, useLocation } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
@@ -21,8 +22,10 @@ import ResponderIncidentDetails from "@/pages/ResponderIncidentDetails";
 import ResponderSettings from "@/pages/ResponderSettings";
 import ForgotPassword from "@/pages/ForgotPassword";
 import NotFound from "@/pages/NotFound";
+import { syncOfflineQueuedReportsForResident } from "@/lib/offlineReportSync";
 
 const queryClient = new QueryClient();
+const OFFLINE_REPORT_SYNC_INTERVAL_MS = 15000;
 
 function AppRoutes() {
   const { user } = useAuth();
@@ -30,6 +33,53 @@ function AppRoutes() {
   const isResident = user?.role === "resident";
   const isResponder = user?.role === "responder";
   const showResponderNav = isResponder && !pathname.startsWith("/responder/incidents/");
+
+  useEffect(() => {
+    if (!isResident || !user) {
+      return;
+    }
+
+    let disposed = false;
+
+    const runSync = async () => {
+      if (disposed || !navigator.onLine) {
+        return;
+      }
+
+      await syncOfflineQueuedReportsForResident({
+        id: user.id,
+        name: user.name,
+        email: user.email,
+      });
+    };
+
+    const onOnline = () => {
+      void runSync();
+    };
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void runSync();
+      }
+    };
+
+    window.addEventListener("online", onOnline);
+    window.addEventListener("focus", onOnline);
+    document.addEventListener("visibilitychange", onVisible);
+
+    void runSync();
+    const intervalId = window.setInterval(() => {
+      void runSync();
+    }, OFFLINE_REPORT_SYNC_INTERVAL_MS);
+
+    return () => {
+      disposed = true;
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("focus", onOnline);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.clearInterval(intervalId);
+    };
+  }, [isResident, user]);
 
   return (
     <div className="min-h-screen bg-background">

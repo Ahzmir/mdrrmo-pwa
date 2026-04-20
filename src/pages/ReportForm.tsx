@@ -30,12 +30,9 @@ import { addDoc, collection, doc, getDoc, getDocFromServer, serverTimestamp } fr
 import { uploadImageToFirebaseStorage } from "@/lib/storageUpload";
 import {
   addOfflineQueuedReport,
-  getPendingOfflineQueuedReportsByResident,
-  markOfflineQueuedReportAttempted,
-  markOfflineQueuedReportFailed,
-  markOfflineQueuedReportSent,
   type OfflineQueuedReportEntry,
 } from "@/lib/offlineQueuedReports";
+import { syncOfflineQueuedReportsForResident } from "@/lib/offlineReportSync";
 import { toast } from "sonner";
 
 const categories: { id: IncidentCategory; icon: typeof Flame; label: string; color: string }[] = [
@@ -113,6 +110,7 @@ export default function ReportForm() {
   const firebaseProjectId = (import.meta.env.VITE_FIREBASE_PROJECT_ID as string | undefined) || "(missing-project-id)";
 
   const effectiveOffline = offline || forceOfflineMode;
+  const smsFallbackNumber = (import.meta.env.VITE_SMS_FALLBACK_NUMBER as string | undefined)?.trim() || "+639177044103";
 
   const submitted = submittedMode !== null;
 
@@ -142,6 +140,81 @@ export default function ReportForm() {
 
     addOfflineQueuedReport(entry);
     return entry;
+  }
+
+  function categoryToSmsLabel(value: IncidentCategory) {
+    if (value === "fire") return "FIRE";
+    if (value === "medical") return "MEDICAL";
+    if (value === "crime") return "CRIME";
+    return "DISASTER";
+  }
+
+  function normalizeSmsFieldValue(value: string) {
+    return value
+      .replace(/[;|]+/g, " ")
+      .replace(/\r\n|\n|\r/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function canonicalizeSmsFallbackMessage(value: string) {
+    return value
+      .replace(/\r\n|\n|\r/g, " ")
+      .replace(/\s+/g, " ")
+      .replace(/\s*;\s*/g, "; ")
+      .trim();
+  }
+
+  function buildSmsFallbackMessage() {
+    if (!category || !location || !coordinates) {
+      return null;
+    }
+
+    const oneLineLocation = normalizeSmsFieldValue(location);
+    const oneLineDescription = normalizeSmsFieldValue(description) || "N/A";
+    const oneLineReporter = normalizeSmsFieldValue(user?.name || "Resident");
+
+    return [
+      "MDRRMO INCIDENT REPORT",
+      `CATEGORY: ${categoryToSmsLabel(category)}`,
+      `LOCATION: ${oneLineLocation}`,
+      `COORDS: ${coordinates.lat.toFixed(5)}, ${coordinates.lng.toFixed(5)}`,
+      `DESCRIPTION: ${oneLineDescription}`,
+      `REPORTER: ${oneLineReporter}`,
+      `TIME: ${new Date().toLocaleString()}`,
+    ].join("; ");
+  }
+
+  function launchSmsFallback(message: string) {
+    const recipient = smsFallbackNumber.replace(/[^\d+]/g, "");
+    const encodedBody = encodeURIComponent(canonicalizeSmsFallbackMessage(message));
+    const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    const smsUri = isIos
+      ? `sms:${recipient}&body=${encodedBody}`
+      : `sms:${recipient}?body=${encodedBody}`;
+
+    const openUri = (uri: string) => {
+      try {
+        window.location.href = uri;
+      } catch {
+        const anchor = document.createElement("a");
+        anchor.href = uri;
+        anchor.style.display = "none";
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+      }
+    };
+
+    openUri(smsUri);
+
+    if (!isIos) {
+      window.setTimeout(() => {
+        if (!document.hidden) {
+          openUri(`smsto:${recipient}?body=${encodedBody}`);
+        }
+      }, 250);
+    }
   }
 
   function getPriorityByCategory(value: IncidentCategory): "Critical" | "High" {
@@ -232,65 +305,15 @@ export default function ReportForm() {
   }, []);
 
   useEffect(() => {
-    if (!user || user.role !== "resident" || !isResidentVerified) {
+    if (!user || user.role !== "resident" || !isResidentVerified || !navigator.onLine) {
       return;
     }
 
-    let disposed = false;
-    let syncing = false;
-
-    const syncQueuedReports = async () => {
-      if (disposed || syncing || !navigator.onLine) {
-        return;
-      }
-
-      syncing = true;
-      const pending = getPendingOfflineQueuedReportsByResident(user.id);
-
-      for (const entry of pending) {
-        if (disposed || !navigator.onLine) {
-          break;
-        }
-
-        markOfflineQueuedReportAttempted(entry.id);
-        try {
-          const incidentId = await submitIncidentToFirestore({
-            residentId: entry.residentId,
-            residentName: entry.residentName,
-            residentEmail: entry.residentEmail,
-            residentPhone: entry.residentPhone,
-            barangay: entry.barangay,
-            category: entry.category,
-            description: entry.description,
-            location: entry.location,
-            coordinates: entry.coordinates,
-            photoFile: null,
-          });
-          markOfflineQueuedReportSent(entry.id, incidentId);
-        } catch (error) {
-          const reason = (error as { message?: string }).message || "Unable to auto-send queued report.";
-          markOfflineQueuedReportFailed(entry.id, reason);
-          if (!isConnectivityError(error)) {
-            // Stop on non-network errors (e.g., permission), avoid retry storm.
-            break;
-          }
-        }
-      }
-
-      syncing = false;
-    };
-
-    const onOnline = () => {
-      void syncQueuedReports();
-    };
-
-    window.addEventListener("online", onOnline);
-    void syncQueuedReports();
-
-    return () => {
-      disposed = true;
-      window.removeEventListener("online", onOnline);
-    };
+    void syncOfflineQueuedReportsForResident({
+      id: user.id,
+      name: user.name,
+      email: user.email,
+    });
   }, [user, isResidentVerified]);
 
   useEffect(() => {
@@ -633,7 +656,13 @@ export default function ReportForm() {
         return;
       }
 
-      toast.success("Report saved offline. It will auto-send once internet is available.");
+      const smsMessage = buildSmsFallbackMessage();
+      if (smsMessage) {
+        toast.info("Report saved offline. SMS app will open for immediate fallback send.");
+        launchSmsFallback(smsMessage);
+      } else {
+        toast.success("Report saved offline. It will auto-send once internet is available.");
+      }
       setSubmittedMode("queued");
       return;
     }
@@ -1015,7 +1044,7 @@ export default function ReportForm() {
       {effectiveOffline && (
         <div className="mb-3 rounded-xl border-2 border-dashed border-warning bg-warning-light px-3 py-2">
           <p className="text-xs font-semibold text-warning-foreground">
-            Offline queue mode is active. Reports are saved in-app first, then automatically submitted when internet connection is detected.
+            Offline mode is active. Reports are saved in-app first, then SMS app opens for immediate fallback send. If SMS fails (no load), the queued report auto-submits when internet is available.
           </p>
         </div>
       )}
@@ -1065,11 +1094,11 @@ export default function ReportForm() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {effectiveOffline ? "Save this report offline now?" : "Submit incident report now?"}
+              {effectiveOffline ? "Save offline and open SMS fallback now?" : "Submit incident report now?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {effectiveOffline
-                ? "The report will be stored in the app and automatically submitted once internet connection is available."
+                ? "The report will be saved offline first, then the SMS app opens for immediate sending. If SMS cannot be sent, it will auto-submit once internet returns."
                 : "Please confirm the report details are correct before sending to MDRRMO."}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -1081,7 +1110,7 @@ export default function ReportForm() {
                 void handleSubmit();
               }}
             >
-              {effectiveOffline ? "Save Offline" : "Submit Report"}
+              {effectiveOffline ? "Save + Open SMS" : "Submit Report"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
