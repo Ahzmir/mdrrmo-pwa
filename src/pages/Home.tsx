@@ -13,9 +13,13 @@ export default function Home() {
     <div className="mx-auto flex max-w-lg flex-col gap-6 bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)] px-4 pt-6 pb-24">
       {/* Header */}
       <div className="text-center">
-        <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-orange-300 bg-orange-100 px-3 py-1 text-xs font-semibold text-orange-600">
-          <AlertTriangle size={14} />
-          Emergency Response
+        <img
+          src="/assets/banisilan.png"
+          alt="Municipality of Banisilan Seal"
+          className="mx-auto mb-3 h-20 w-20 object-contain"
+        />
+        <div className="mb-2 inline-flex items-center rounded-full border border-orange-300 bg-orange-100 px-3 py-1 text-xs font-semibold text-orange-600">
+          MDRRMO Banisilan
         </div>
         <h1 className="text-3xl font-black tracking-tight text-orange-600">
           Community Safety

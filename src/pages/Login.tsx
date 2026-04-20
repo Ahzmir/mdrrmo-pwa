@@ -5,7 +5,7 @@ import {
   RESIDENT_REJECTION_REASON_KEY,
   useAuth,
 } from "@/contexts/AuthContext";
-import { Loader2, AlertTriangle } from "lucide-react";
+import { Loader2 } from "lucide-react";
 
 export default function Login() {
   const { login, loading, isAuthenticated, user } = useAuth();
@@ -50,9 +50,13 @@ export default function Login() {
       <div className="w-full max-w-sm space-y-5">
         {/* Logo / Header */}
         <div className="rounded-2xl border border-white/45 bg-white/45 p-5 text-center space-y-2 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
-          <div className="inline-flex items-center gap-2 rounded-full border border-orange-300 bg-orange-100 px-3 py-1 text-xs font-semibold text-orange-600">
-            <AlertTriangle size={14} />
-            Emergency Response
+          <img
+            src="/assets/banisilan.png"
+            alt="Municipality of Banisilan Seal"
+            className="mx-auto h-20 w-20 object-contain"
+          />
+          <div className="inline-flex items-center rounded-full border border-orange-300 bg-orange-100 px-3 py-1 text-xs font-semibold text-orange-600">
+            MDRRMO Banisilan
           </div>
           <h1 className="text-4xl font-black leading-tight text-orange-600">Sign In</h1>
           <p className="text-sm text-muted-foreground">Access the emergency response system</p>
