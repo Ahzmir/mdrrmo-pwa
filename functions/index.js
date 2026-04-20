@@ -5,7 +5,7 @@ const logger = require("firebase-functions/logger");
 const crypto = require("node:crypto");
 const admin = require("firebase-admin");
 
-const { sendSmsMobileApi } = require("./smsmobileapi");
+const { sendSmsMobileApi, fetchSmsMobileInbox } = require("./smsmobileapi");
 
 // smsmobileapi migration constants
 const SMSMOBILEAPI_API_KEY = "8e82949f466e58ed578ff58a38038bc0b82881aaefb85540";
@@ -40,6 +40,9 @@ function parseInboundSmsPayload(payload) {
 }
 
 async function storeInboundSms({ sender, message, source, extra = {} }) {
+  const forcedSmsId = typeof extra.forcedSmsId === "string" ? extra.forcedSmsId.trim() : "";
+  const { forcedSmsId: _ignoredForcedSmsId, ...extraPayload } = extra;
+
   const basePayload = {
     sender,
     phone: sender,
@@ -50,16 +53,16 @@ async function storeInboundSms({ sender, message, source, extra = {} }) {
     converted: false,
     receivedAt: admin.firestore.FieldValue.serverTimestamp(),
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    ...extra,
+    ...extraPayload,
   };
 
-  const smsId = db.collection("incoming_sms").doc().id;
+  const smsId = forcedSmsId || db.collection("incoming_sms").doc().id;
   const incomingRef = db.collection("incoming_sms").doc(smsId);
   const smsInboxRef = db.collection("smsInbox").doc(smsId);
 
   await Promise.all([
-    incomingRef.set(basePayload),
-    smsInboxRef.set(basePayload),
+    incomingRef.set(basePayload, { merge: true }),
+    smsInboxRef.set(basePayload, { merge: true }),
   ]);
 
   return {
@@ -145,7 +148,7 @@ function toDateValue(value) {
 }
 
 function extractLabeledSmsValue(message, label) {
-  const matcher = new RegExp(`^${label}\\s*:\\s*(.+)$`, "im");
+  const matcher = new RegExp(`(?:^|\\||\\n)\\s*${label}\\s*:\\s*([^|\\n]+)`, "i");
   const match = message.match(matcher);
   if (!match || typeof match[1] !== "string") {
     return null;
@@ -372,6 +375,87 @@ function buildIncidentFromInboundSms({ smsId, data }) {
   };
 }
 
+function sanitizeDocIdSegment(value) {
+  const normalized = toTrimmedString(value).replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return normalized.slice(0, 80);
+}
+
+function buildGatewaySmsDocId(provider, gatewayMessageId) {
+  const providerPart = sanitizeDocIdSegment(provider) || "gateway";
+  const messagePart = sanitizeDocIdSegment(gatewayMessageId);
+  if (!messagePart) {
+    return null;
+  }
+  return `gateway-${providerPart}-${messagePart}`;
+}
+
+function normalizeSmsMobileInboxItems(payload) {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const candidateLists = [
+    payload.messages,
+    payload.items,
+    payload.data,
+    payload.results,
+    payload.inbox,
+  ];
+
+  for (const candidate of candidateLists) {
+    if (Array.isArray(candidate)) {
+      return candidate;
+    }
+  }
+
+  return [];
+}
+
+function parseSmsMobileInboxItem(row) {
+  if (!row || typeof row !== "object") {
+    return null;
+  }
+
+  const sender =
+    toTrimmedString(row.from) ||
+    toTrimmedString(row.sender) ||
+    toTrimmedString(row.number) ||
+    toTrimmedString(row.phone) ||
+    "Unknown sender";
+  const message =
+    toTrimmedString(row.message) ||
+    toTrimmedString(row.body) ||
+    toTrimmedString(row.text) ||
+    toTrimmedString(row.content);
+
+  if (!message) {
+    return null;
+  }
+
+  const gatewayMessageId =
+    toTrimmedString(row.message_id) ||
+    toTrimmedString(row.messageId) ||
+    toTrimmedString(row.smsId) ||
+    toTrimmedString(row.id) ||
+    null;
+  const gatewayReceivedAt =
+    toTrimmedString(row.receivedAt) ||
+    toTrimmedString(row.timestamp) ||
+    toTrimmedString(row.date) ||
+    null;
+
+  return {
+    sender,
+    message,
+    gatewayMessageId,
+    gatewayReceivedAt,
+  };
+}
+
 function parseSmsFallbackPayload(data) {
   const reportId = typeof data?.reportId === "string" ? data.reportId.trim() : "";
   const smsBody = typeof data?.smsBody === "string" ? data.smsBody.trim() : "";
@@ -490,6 +574,66 @@ async function assertAdminCaller(request) {
     throw new HttpsError("permission-denied", "Only admins can perform this action.");
   }
 }
+
+exports.syncSmsMobileInbox = onCall(async (request) => {
+  await assertAdminCaller(request);
+
+  const requestedLimit =
+    typeof request.data?.limit === "number" && Number.isFinite(request.data.limit)
+      ? request.data.limit
+      : 50;
+  const limit = Math.max(1, Math.min(200, Math.floor(requestedLimit)));
+
+  const inboxPayload = await fetchSmsMobileInbox({
+    apiKey: SMSMOBILEAPI_API_KEY,
+    limit,
+  });
+  const inboxRows = normalizeSmsMobileInboxItems(inboxPayload);
+
+  let ingested = 0;
+  let skipped = 0;
+
+  for (const row of inboxRows) {
+    const parsed = parseSmsMobileInboxItem(row);
+    if (!parsed) {
+      skipped += 1;
+      continue;
+    }
+
+    const forcedSmsId = parsed.gatewayMessageId
+      ? buildGatewaySmsDocId("smsmobileapi", parsed.gatewayMessageId)
+      : null;
+
+    if (forcedSmsId) {
+      const existing = await db.collection("incoming_sms").doc(forcedSmsId).get();
+      if (existing.exists) {
+        skipped += 1;
+        continue;
+      }
+    }
+
+    await storeInboundSms({
+      sender: parsed.sender,
+      message: parsed.message,
+      source: "smsmobileapi",
+      extra: {
+        provider: "smsmobileapi",
+        gatewayMessageId: parsed.gatewayMessageId,
+        gatewayReceivedAt: parsed.gatewayReceivedAt,
+        ...(forcedSmsId ? { forcedSmsId } : {}),
+      },
+    });
+    ingested += 1;
+  }
+
+  return {
+    ok: true,
+    provider: "smsmobileapi",
+    fetched: inboxRows.length,
+    ingested,
+    skipped,
+  };
+});
 
 function parsePayload(data) {
   const uid = typeof data?.uid === "string" ? data.uid.trim() : "";
@@ -795,6 +939,66 @@ exports.semaphoreInboundSms = onRequest(async (req, res) => {
     res.status(200).json({ ok: true });
   } catch (error) {
     logger.error("Failed to process Semaphore inbound SMS", {
+      message: error?.message,
+    });
+    res.status(500).json({ ok: false });
+  }
+});
+
+exports.smsmobileapiInboundSms = onRequest({
+  secrets: [simInboundTokenSecret],
+}, async (req, res) => {
+  if (req.method !== "POST") {
+    res.status(405).send("Method Not Allowed");
+    return;
+  }
+
+  try {
+    let payload = req.body;
+    if (!payload || typeof payload !== "object") {
+      const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody.toString("utf8") : "";
+      payload = Object.fromEntries(new URLSearchParams(raw));
+    }
+
+    const expectedToken = readSimInboundToken();
+    const providedToken = extractInboundBridgeToken(req, payload);
+    if (!safeTokenEquals(providedToken, expectedToken)) {
+      logger.warn("Rejected smsmobileapi inbound SMS due to invalid token", {
+        senderHint:
+          (typeof payload?.From === "string" && payload.From.trim()) ||
+          (typeof payload?.from === "string" && payload.from.trim()) ||
+          (typeof payload?.sender === "string" && payload.sender.trim()) ||
+          (typeof payload?.number === "string" && payload.number.trim()) ||
+          null,
+      });
+      res.status(401).json({ ok: false, error: "Unauthorized" });
+      return;
+    }
+
+    const { sender, message } = parseInboundSmsPayload(payload);
+
+    await storeInboundSms({
+      sender,
+      message,
+      source: "smsmobileapi",
+      extra: {
+        provider: "smsmobileapi",
+        gatewayMessageId:
+          toTrimmedString(payload?.messageId) ||
+          toTrimmedString(payload?.smsId) ||
+          toTrimmedString(payload?.id) ||
+          null,
+        gatewayReceivedAt:
+          toTrimmedString(payload?.receivedAt) ||
+          toTrimmedString(payload?.timestamp) ||
+          toTrimmedString(payload?.date) ||
+          null,
+      },
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    logger.error("Failed to process smsmobileapi inbound SMS", {
       message: error?.message,
     });
     res.status(500).json({ ok: false });

@@ -17,15 +17,12 @@ Resident sign-up verification files (ID/proof documents) and incident photos are
 
 Important: do not put Firebase service-account JSON keys in this frontend project. Service-account credentials must stay on a backend/server only.
 
-## Semaphore SMS Fallback
+## SMS Fallback (SMSMobileAPI)
 
-Offline incident submissions now queue locally and sync through a Firebase callable function (`submitSmsFallbackReport`) that sends via Semaphore.
+Offline incident submissions now queue locally and sync through a Firebase callable function (`submitSmsFallbackReport`) that sends via SMSMobileAPI.
 
 Set these Cloud Functions environment variables before deploying functions:
 
-- `SEMAPHORE_API_KEY`
-- `SMS_FALLBACK_NUMBER`
-- `SEMAPHORE_SENDERNAME` (optional; defaults to `MDRRMO`)
 - `SIM_INBOUND_TOKEN` (required for SIM-bridge inbound webhook auth)
 
 For local emulation, copy `functions/.env.example` to `functions/.env` and fill the same values.
@@ -33,12 +30,10 @@ For local emulation, copy `functions/.env.example` to `functions/.env` and fill 
 Example (Firebase CLI):
 
 ```bash
-firebase functions:secrets:set SEMAPHORE_API_KEY
-firebase functions:secrets:set SMS_FALLBACK_NUMBER
 firebase functions:secrets:set SIM_INBOUND_TOKEN
 ```
 
-`SEMAPHORE_SENDERNAME` can be set via `functions/.env` (or runtime env) if you need a custom sender name.
+SMS destination is currently defined in `functions/index.js` as `SMSMOBILEAPI_DESTINATION`.
 
 ## SIM Bridge Inbound SMS
 
@@ -55,3 +50,14 @@ Accepted payload fields:
 - Optional metadata: `messageId`/`smsId`, `receivedAt`/`timestamp`
 
 When accepted, the function writes to `incoming_sms` and `smsInbox`, so admin SMS view and incident auto-conversion continue to work.
+
+## SMSMobileAPI Inbound Webhook
+
+If SMSMobileAPI is receiving inbound SMS, set its webhook URL to:
+
+`https://us-central1-<your-project-id>.cloudfunctions.net/smsmobileapiInboundSms`
+
+Required auth:
+- Header `x-api-key: <SIM_INBOUND_TOKEN>` (or `x-bridge-token` / `Authorization: Bearer <SIM_INBOUND_TOKEN>`)
+
+When accepted, the message is written to `incoming_sms` and `smsInbox` for admin-side conversion to an incident.

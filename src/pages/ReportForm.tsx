@@ -143,7 +143,7 @@ export default function ReportForm() {
       `TIME: ${new Date().toLocaleString()}`,
     ];
 
-    return messageLines.join("\n");
+    return messageLines.join(" | ");
   }
 
   function launchSmsFallback(message: string) {
