@@ -155,14 +155,46 @@ function toDateValue(value) {
 }
 
 function extractLabeledSmsValue(message, label) {
-  const matcher = new RegExp(`(?:^|\\||;|\\n)\\s*${label}\\s*:\\s*(.+?)(?=(?:\\s*(?:\\||;|\\n)\\s*[A-Z_]+\\s*:)|$)`, "i");
-  const match = message.match(matcher);
-  if (!match || typeof match[1] !== "string") {
+  const source = toTrimmedString(message);
+  if (!source) {
     return null;
   }
 
-  const value = match[1].trim();
+  const upper = source.toUpperCase();
+  const token = `${label.toUpperCase()}:`;
+  const start = upper.indexOf(token);
+  if (start < 0) {
+    return null;
+  }
+
+  const valueStart = start + token.length;
+  const labelTokens = ["CATEGORY:", "LOCATION:", "COORDS:", "DESCRIPTION:", "REPORTER:", "TIME:"];
+  let valueEnd = source.length;
+
+  for (const candidate of labelTokens) {
+    if (candidate === token) continue;
+    const next = upper.indexOf(candidate, valueStart);
+    if (next >= 0 && next < valueEnd) {
+      valueEnd = next;
+    }
+  }
+
+  const value = source.slice(valueStart, valueEnd).replace(/[;|\r\n]+/g, " ").replace(/\s+/g, " ").trim();
   return value.length > 0 ? value : null;
+}
+
+function isStructuredIncidentReportSms(message) {
+  const source = toTrimmedString(message);
+  if (!source) {
+    return false;
+  }
+
+  if (/\r|\n/.test(source)) {
+    return false;
+  }
+
+  const strictPattern = /^MDRRMO INCIDENT REPORT;\s*CATEGORY:\s*[^;]+;\s*LOCATION:\s*[^;]+;\s*COORDS:\s*[^;]+;\s*DESCRIPTION:\s*[^;]*;\s*REPORTER:\s*[^;]+;\s*TIME:\s*.+$/i;
+  return strictPattern.test(source);
 }
 
 function normalizeIncidentCategory(value) {
@@ -405,6 +437,10 @@ function normalizeSmsMobileInboxItems(payload) {
     return [];
   }
 
+  if (payload.result && typeof payload.result === "object" && Array.isArray(payload.result.sms)) {
+    return payload.result.sms;
+  }
+
   const candidateLists = [
     payload.messages,
     payload.items,
@@ -444,12 +480,16 @@ function parseSmsMobileInboxItem(row) {
   }
 
   const gatewayMessageId =
+    toTrimmedString(row.guid) ||
     toTrimmedString(row.message_id) ||
     toTrimmedString(row.messageId) ||
     toTrimmedString(row.smsId) ||
     toTrimmedString(row.id) ||
     null;
   const gatewayReceivedAt =
+    (typeof row.timestamp_unix === "number" && Number.isFinite(row.timestamp_unix)
+      ? new Date(row.timestamp_unix * 1000).toISOString()
+      : "") ||
     toTrimmedString(row.receivedAt) ||
     toTrimmedString(row.timestamp) ||
     toTrimmedString(row.date) ||
@@ -599,11 +639,17 @@ exports.syncSmsMobileInbox = onCall(async (request) => {
 
   let ingested = 0;
   let skipped = 0;
+  let filteredOut = 0;
 
   for (const row of inboxRows) {
     const parsed = parseSmsMobileInboxItem(row);
     if (!parsed) {
       skipped += 1;
+      continue;
+    }
+
+    if (!isStructuredIncidentReportSms(parsed.message)) {
+      filteredOut += 1;
       continue;
     }
 
@@ -639,6 +685,7 @@ exports.syncSmsMobileInbox = onCall(async (request) => {
     fetched: inboxRows.length,
     ingested,
     skipped,
+    filteredOut,
   };
 });
 
@@ -899,6 +946,11 @@ exports.twilioInboundSms = onRequest(async (req, res) => {
     }
 
     const { sender, message } = parseInboundSmsPayload(payload);
+
+    if (!isStructuredIncidentReportSms(message)) {
+      res.status(200).json({ ok: true, ignored: true, reason: "unstructured" });
+      return;
+    }
 
     await storeInboundSms({
       sender,

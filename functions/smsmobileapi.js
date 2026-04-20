@@ -1,23 +1,44 @@
 // smsmobileapi.js
 const fetch = require('node-fetch');
 
-const SMSMOBILEAPI_ENDPOINT = 'https://smsmobileapi.com/api/v3/sms/send';
-const SMSMOBILEAPI_INBOX_ENDPOINT = process.env.SMSMOBILEAPI_INBOX_ENDPOINT || 'https://smsmobileapi.com/api/v3/sms/inbox';
+const SMSMOBILEAPI_SEND_ENDPOINT = process.env.SMSMOBILEAPI_SEND_ENDPOINT || 'https://api.smsmobileapi.com/sendsms/';
+const SMSMOBILEAPI_SEND_FALLBACK_ENDPOINT = process.env.SMSMOBILEAPI_SEND_FALLBACK_ENDPOINT || 'https://smsmobileapi.com/api/v3/sms/send';
+const SMSMOBILEAPI_INBOX_ENDPOINT = process.env.SMSMOBILEAPI_INBOX_ENDPOINT || 'https://api.smsmobileapi.com/getsms/';
+
+function isSendSuccess(responseBody) {
+  if (!responseBody || typeof responseBody !== 'object') {
+    return false;
+  }
+
+  if (responseBody.success === true) {
+    return true;
+  }
+
+  const result = responseBody.result;
+  if (!result || typeof result !== 'object') {
+    return false;
+  }
+
+  const errorValue = result.error;
+  const sentValue = result.sent;
+  const noError = errorValue === 0 || errorValue === '0' || errorValue === '' || errorValue === null;
+  const sent = sentValue === 1 || sentValue === '1' || sentValue === true;
+  return noError && sent;
+}
 
 async function sendSmsMobileApi({ apiKey, destination, message }) {
-  const payload = {
-    api_key: apiKey,
-    recipient: destination,
-    message,
-  };
+  const formPayload = new URLSearchParams();
+  formPayload.set('apikey', apiKey);
+  formPayload.set('recipients', destination);
+  formPayload.set('message', message);
 
-  const response = await fetch(SMSMOBILEAPI_ENDPOINT, {
+  const response = await fetch(SMSMOBILEAPI_SEND_ENDPOINT, {
     method: 'POST',
     headers: {
       'Accept': 'application/json',
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: JSON.stringify(payload),
+    body: formPayload.toString(),
   });
 
   let responseBody = null;
@@ -27,24 +48,12 @@ async function sendSmsMobileApi({ apiKey, destination, message }) {
     responseBody = null;
   }
 
-  if (!response.ok) {
-    throw new Error(
-      `SMSMobileAPI request failed with status ${response.status}: ${JSON.stringify(responseBody)}`
-    );
+  if (response.ok && isSendSuccess(responseBody)) {
+    return responseBody;
   }
 
-  // Adjust this check based on actual API response
-  if (!responseBody || !responseBody.success) {
-    throw new Error('SMSMobileAPI response did not indicate success.');
-  }
-
-  return responseBody;
-}
-
-async function fetchSmsMobileInbox({ apiKey, limit = 50 }) {
-  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(200, Number(limit))) : 50;
-
-  const postResponse = await fetch(SMSMOBILEAPI_INBOX_ENDPOINT, {
+  // Fallback for older endpoint variants.
+  const fallbackResponse = await fetch(SMSMOBILEAPI_SEND_FALLBACK_ENDPOINT, {
     method: 'POST',
     headers: {
       'Accept': 'application/json',
@@ -52,25 +61,32 @@ async function fetchSmsMobileInbox({ apiKey, limit = 50 }) {
     },
     body: JSON.stringify({
       api_key: apiKey,
-      limit: safeLimit,
+      recipient: destination,
+      message,
     }),
   });
 
-  let postBody = null;
+  let fallbackBody = null;
   try {
-    postBody = await postResponse.json();
+    fallbackBody = await fallbackResponse.json();
   } catch {
-    postBody = null;
+    fallbackBody = null;
   }
 
-  if (postResponse.ok) {
-    return postBody;
+  if (fallbackResponse.ok && isSendSuccess(fallbackBody)) {
+    return fallbackBody;
   }
 
-  // Some providers expose inbox via GET with API key in query params.
+  throw new Error(
+    `SMSMobileAPI send failed. Primary status ${response.status}, fallback status ${fallbackResponse.status}`
+  );
+}
+
+async function fetchSmsMobileInbox({ apiKey, limit = 50 }) {
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(200, Number(limit))) : 50;
   const query = new URLSearchParams({
-    api_key: apiKey,
-    limit: String(safeLimit),
+    apikey: apiKey,
+    onlyunread: 'yes',
   });
   const getResponse = await fetch(`${SMSMOBILEAPI_INBOX_ENDPOINT}?${query.toString()}`, {
     method: 'GET',
@@ -88,8 +104,22 @@ async function fetchSmsMobileInbox({ apiKey, limit = 50 }) {
 
   if (!getResponse.ok) {
     throw new Error(
-      `SMSMobileAPI inbox request failed. POST status ${postResponse.status}, GET status ${getResponse.status}`
+      `SMSMobileAPI inbox request failed with status ${getResponse.status}`
     );
+  }
+
+  if (!getBody || typeof getBody !== 'object' || !getBody.result || !Array.isArray(getBody.result.sms)) {
+    throw new Error('SMSMobileAPI inbox response format is invalid (expected result.sms array).');
+  }
+
+  if (safeLimit < getBody.result.sms.length) {
+    return {
+      ...getBody,
+      result: {
+        ...getBody.result,
+        sms: getBody.result.sms.slice(0, safeLimit),
+      },
+    };
   }
 
   return getBody;

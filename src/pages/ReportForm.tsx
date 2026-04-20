@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Flame,
@@ -30,13 +30,9 @@ import { addDoc, collection, doc, getDoc, getDocFromServer, serverTimestamp } fr
 import { uploadImageToFirebaseStorage } from "@/lib/storageUpload";
 import {
   addOfflineSmsReport,
-  getPendingOfflineSmsReportsByResident,
   markOfflineSmsReportAttempted,
-  markOfflineSmsReportFailed,
-  markOfflineSmsReportSent,
   type OfflineSmsReportEntry,
 } from "@/lib/offlineSmsReports";
-import { submitSmsFallbackReport } from "@/lib/semaphoreSmsFallback";
 import { toast } from "sonner";
 
 const categories: { id: IncidentCategory; icon: typeof Flame; label: string; color: string }[] = [
@@ -125,7 +121,11 @@ export default function ReportForm() {
   }
 
   function normalizeOneLine(value: string) {
-    return value.replace(/\r\n|\n|\r/g, " ").replace(/\s+/g, " ").trim();
+    return value
+      .replace(/[;|]+/g, " ")
+      .replace(/\r\n|\n|\r/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   function buildSmsFallbackMessage() {
@@ -190,61 +190,9 @@ export default function ReportForm() {
     return entry;
   }
 
-  const syncOfflineSmsEntry = useCallback(async (entry: OfflineSmsReportEntry) => {
-    if (!user || user.role !== "resident") {
-      return false;
-    }
-
-    markOfflineSmsReportAttempted(entry.id);
-
-    try {
-      const result = await submitSmsFallbackReport({
-        reportId: entry.id,
-        smsBody: entry.smsBody,
-        category: entry.category,
-        description: entry.description,
-        location: entry.location,
-        coordinates: entry.coordinates,
-        createdAtIso: entry.createdAtIso,
-        reporterName: user.name,
-        reporterPhone: residentPhone,
-        reporterEmail: user.email,
-      });
-
-      const firstGatewayMessageId = Array.isArray(result.semaphoreMessageIds)
-        ? result.semaphoreMessageIds[0] || null
-        : null;
-      markOfflineSmsReportSent(entry.id, firstGatewayMessageId);
-      return true;
-    } catch (error) {
-      const message =
-        (error as { message?: string })?.message ||
-        "Unable to sync SMS fallback with SMS gateway.";
-      markOfflineSmsReportFailed(entry.id, message);
-      return false;
-    }
-  }, [residentPhone, user]);
-
-  const syncPendingOfflineSmsReports = useCallback(async () => {
-    if (!user || user.role !== "resident" || !navigator.onLine) {
-      return;
-    }
-
-    const pendingEntries = getPendingOfflineSmsReportsByResident(user.id);
-    if (pendingEntries.length === 0) {
-      return;
-    }
-
-    for (const entry of pendingEntries) {
-      // Send sequentially to avoid tripping SMS provider rate limits.
-      await syncOfflineSmsEntry(entry);
-    }
-  }, [syncOfflineSmsEntry, user]);
-
   useEffect(() => {
     const handleOnline = () => {
       setOffline(false);
-      void syncPendingOfflineSmsReports();
     };
     const handleOffline = () => setOffline(true);
 
@@ -255,15 +203,7 @@ export default function ReportForm() {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
     };
-  }, [syncPendingOfflineSmsReports]);
-
-  useEffect(() => {
-    if (!user || user.role !== "resident" || !navigator.onLine) {
-      return;
-    }
-
-    void syncPendingOfflineSmsReports();
-  }, [syncPendingOfflineSmsReports, user]);
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -611,20 +551,13 @@ export default function ReportForm() {
       }
 
       if (!navigator.onLine) {
-        toast.info("No internet connection. Opening SMS app now. If you have no load, this report stays queued and will auto-send via internet later.");
-        launchSmsFallback(smsMessage);
-        markOfflineSmsReportAttempted(queuedEntry.id);
-        setSubmitted(true);
-        return;
+        toast.info("No internet connection. Opening SMS app now. Send the report SMS to continue.");
+      } else {
+        toast.info("SMS fallback mode is active. Opening SMS app now. Send the report SMS to continue.");
       }
 
-      const sentViaGateway = await syncOfflineSmsEntry(queuedEntry);
-      if (sentViaGateway) {
-        toast.success("Report sent via SMS fallback gateway.");
-      } else {
-        toast.warning("Gateway send failed. Opening your SMS app as backup.");
-        launchSmsFallback(smsMessage);
-      }
+      launchSmsFallback(smsMessage);
+      markOfflineSmsReportAttempted(queuedEntry.id);
 
       setSubmitted(true);
       return;
@@ -1039,7 +972,7 @@ export default function ReportForm() {
       {effectiveOffline && (
         <div className="mb-3 rounded-xl border-2 border-dashed border-warning bg-warning-light px-3 py-2">
           <p className="text-xs font-semibold text-warning-foreground">
-            SMS fallback mode is active. If internet is offline, your SMS app opens for immediate send to {smsFallbackNumber}. If SMS cannot send (e.g., no load), this report stays queued and auto-syncs via SMS fallback gateway once internet is back.
+            SMS fallback mode is active. The app will open your SMS app to send one incident message to {smsFallbackNumber}. After gateway receive, admin will review and convert it to an incident report.
           </p>
         </div>
       )}
@@ -1093,7 +1026,7 @@ export default function ReportForm() {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {effectiveOffline
-                ? "If online, this sends through the SMS fallback gateway now. If offline, your SMS app opens for immediate send. If SMS fails (like no load), the report remains queued for auto-sync once internet returns."
+                ? "This uses SMS fallback only: open SMS app, send the formatted one-line report, then gateway/admin intake and conversion follows."
                 : "Please confirm the report details are correct before sending to MDRRMO."}
             </AlertDialogDescription>
           </AlertDialogHeader>
