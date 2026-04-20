@@ -35,7 +35,7 @@ type RouteOption = {
   distance: number | null;
   duration: number | null;
   instructions: RouteInstruction[];
-  source: "google" | "fallback";
+  source: "google";
 };
 
 type RoutePolylineLayers = {
@@ -472,133 +472,6 @@ function distanceToPolylineMeters(point: LatLng, polyline: LatLng[]) {
   }
 
   return minDistance;
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
-}
-
-function buildOpenStreetMapEmbedUrl({
-  mapCenter,
-  destination,
-  currentPosition,
-}: {
-  mapCenter: LatLng;
-  destination: LatLng;
-  currentPosition: LatLng | null;
-}) {
-  const points = currentPosition
-    ? [mapCenter, destination, currentPosition]
-    : [mapCenter, destination];
-
-  const latitudes = points.map((point) => point[0]);
-  const longitudes = points.map((point) => point[1]);
-
-  const rawMinLat = Math.min(...latitudes);
-  const rawMaxLat = Math.max(...latitudes);
-  const rawMinLng = Math.min(...longitudes);
-  const rawMaxLng = Math.max(...longitudes);
-
-  const latSpan = Math.max(0.01, rawMaxLat - rawMinLat);
-  const lngSpan = Math.max(0.01, rawMaxLng - rawMinLng);
-  const latPadding = latSpan * 0.35;
-  const lngPadding = lngSpan * 0.35;
-
-  const minLat = clamp(rawMinLat - latPadding, -85, 85);
-  const maxLat = clamp(rawMaxLat + latPadding, -85, 85);
-  const minLng = clamp(rawMinLng - lngPadding, -180, 180);
-  const maxLng = clamp(rawMaxLng + lngPadding, -180, 180);
-
-  const bbox = [
-    minLng.toFixed(6),
-    minLat.toFixed(6),
-    maxLng.toFixed(6),
-    maxLat.toFixed(6),
-  ].join(",");
-  const marker = `${destination[0].toFixed(6)},${destination[1].toFixed(6)}`;
-
-  return `https://www.openstreetmap.org/export/embed.html?bbox=${encodeURIComponent(bbox)}&layer=mapnik&marker=${encodeURIComponent(marker)}`;
-}
-
-function buildOpenStreetMapUrl(destination: LatLng) {
-  const lat = destination[0].toFixed(6);
-  const lng = destination[1].toFixed(6);
-  return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lng}#map=16/${lat}/${lng}`;
-}
-
-function buildGoogleDirectionsUrl(destination: LatLng, currentPosition: LatLng | null) {
-  const destinationParam = `${destination[0].toFixed(6)},${destination[1].toFixed(6)}`;
-  if (!currentPosition) {
-    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destinationParam)}`;
-  }
-
-  const originParam = `${currentPosition[0].toFixed(6)},${currentPosition[1].toFixed(6)}`;
-  return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(originParam)}&destination=${encodeURIComponent(destinationParam)}&travelmode=driving`;
-}
-
-function ResponderIncidentFallbackMap({
-  mapCenter,
-  destination,
-  currentPosition,
-  className,
-  isFullscreen,
-}: {
-  mapCenter: LatLng;
-  destination: LatLng;
-  currentPosition: LatLng | null;
-  className: string;
-  isFullscreen: boolean;
-}) {
-  const embedUrl = useMemo(() => buildOpenStreetMapEmbedUrl({
-    mapCenter,
-    destination,
-    currentPosition,
-  }), [mapCenter, destination, currentPosition]);
-  const openStreetMapUrl = useMemo(() => buildOpenStreetMapUrl(destination), [destination]);
-  const googleDirectionsUrl = useMemo(
-    () => buildGoogleDirectionsUrl(destination, currentPosition),
-    [destination, currentPosition]
-  );
-
-  return (
-    <div className={className}>
-      <iframe
-        title="Incident map fallback"
-        src={embedUrl}
-        className="h-full w-full border-0"
-        loading="lazy"
-        referrerPolicy="no-referrer-when-downgrade"
-      />
-
-      <div className="pointer-events-none absolute left-2 top-2 rounded-full border border-white/75 bg-white/92 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-700 shadow-sm">
-        Map Fallback Mode
-      </div>
-
-      <div
-        className={[
-          "absolute left-2 flex flex-wrap gap-2",
-          isFullscreen ? "bottom-20" : "bottom-2",
-        ].join(" ")}
-      >
-        <a
-          href={googleDirectionsUrl}
-          target="_blank"
-          rel="noreferrer"
-          className="rounded-full border border-white/75 bg-white/92 px-2.5 py-1 text-[10px] font-semibold text-foreground shadow-sm"
-        >
-          Open Navigation
-        </a>
-        <a
-          href={openStreetMapUrl}
-          target="_blank"
-          rel="noreferrer"
-          className="rounded-full border border-white/75 bg-white/92 px-2.5 py-1 text-[10px] font-semibold text-foreground shadow-sm"
-        >
-          Open OSM
-        </a>
-      </div>
-    </div>
-  );
 }
 
 function ResponderIncidentGoogleMap({
@@ -1126,15 +999,6 @@ export default function ResponderIncidentDetails() {
   const currentLng = currentPosition?.[1] ?? null;
   const destinationLat = destination?.[0] ?? null;
   const destinationLng = destination?.[1] ?? null;
-  const fallbackDistance = useMemo(() => {
-    if (!currentPosition || !destination) return null;
-    return haversineMeters(currentPosition, destination);
-  }, [currentPosition, destination]);
-  const fallbackDuration = useMemo(() => {
-    if (fallbackDistance === null) return null;
-    const assumedKph = 35;
-    return Math.max(60, (fallbackDistance / 1000 / assumedKph) * 3600);
-  }, [fallbackDistance]);
   const selectedRoute = useMemo(() => {
     if (!routeOptions.length) return null;
     if (!selectedRouteId) return routeOptions[0];
@@ -1153,9 +1017,8 @@ export default function ResponderIncidentDetails() {
     return ranked[0]?.id ?? null;
   }, [routeOptions]);
 
-  const shownDistance = selectedRoute?.distance ?? fallbackDistance;
-  const shownDuration = selectedRoute?.duration ?? fallbackDuration;
-  const routeApproximate = selectedRoute?.source === "fallback" || shownDistance === null || shownDuration === null;
+  const shownDistance = selectedRoute?.distance ?? null;
+  const shownDuration = selectedRoute?.duration ?? null;
   const selectedRouteInstructions = selectedRoute?.instructions ?? [];
   const nextInstruction = selectedRouteInstructions[0] ?? null;
   const destinationLabel = getDestinationLabel(incident?.location || "");
@@ -1292,21 +1155,9 @@ export default function ResponderIncidentDetails() {
     }
 
     if (!hasGoogleMapsKey) {
-      setRouteError("Google Maps key is missing. Showing straight-line fallback route.");
-      setRouteOptions([
-        {
-          id: "fallback",
-          points: [
-            [currentLat, currentLng],
-            [destinationLat, destinationLng],
-          ],
-          distance: fallbackDistance,
-          duration: fallbackDuration,
-          instructions: [],
-          source: "fallback",
-        },
-      ]);
-      setSelectedRouteId("fallback");
+      setRouteError("Google Maps key is missing.");
+      setRouteOptions([]);
+      setSelectedRouteId(null);
       lastRouteKeyRef.current = routeKey;
       return;
     }
@@ -1314,21 +1165,9 @@ export default function ResponderIncidentDetails() {
     let cancelled = false;
     const timeoutId = window.setTimeout(() => {
       if (cancelled) return;
-      setRouteError("Routing request timed out. Showing approximate route.");
-      setRouteOptions([
-        {
-          id: "fallback",
-          points: [
-            [currentLat, currentLng],
-            [destinationLat, destinationLng],
-          ],
-          distance: fallbackDistance,
-          duration: fallbackDuration,
-          instructions: [],
-          source: "fallback",
-        },
-      ]);
-      setSelectedRouteId("fallback");
+      setRouteError("Routing request timed out.");
+      setRouteOptions([]);
+      setSelectedRouteId(null);
       setRouteLoading(false);
       lastRouteKeyRef.current = routeKey;
       cancelled = true;
@@ -1446,20 +1285,8 @@ export default function ResponderIncidentDetails() {
         }
 
         setRouteError((error as Error).message || "Unable to compute route.");
-        setRouteOptions([
-          {
-            id: "fallback",
-            points: [
-              [currentLat, currentLng],
-              [destinationLat, destinationLng],
-            ],
-            distance: fallbackDistance,
-            duration: fallbackDuration,
-            instructions: [],
-            source: "fallback",
-          },
-        ]);
-        setSelectedRouteId("fallback");
+        setRouteOptions([]);
+        setSelectedRouteId(null);
         lastRouteKeyRef.current = routeKey;
       } finally {
         window.clearTimeout(timeoutId);
@@ -1480,8 +1307,6 @@ export default function ResponderIncidentDetails() {
     currentLng,
     destinationLat,
     destinationLng,
-    fallbackDistance,
-    fallbackDuration,
     hasGoogleMapsKey,
     routeRefreshToken,
   ]);
@@ -1510,7 +1335,7 @@ export default function ResponderIncidentDetails() {
     incident.status === "en_route" ||
     incident.status === "on_scene" ||
     incident.status === "resolved";
-  const canGetDirections = !awaitingDecision && (acceptedLocally || acceptedOrBeyond);
+  const canGetDirections = hasGoogleMapsKey && !awaitingDecision && (acceptedLocally || acceptedOrBeyond);
   const mapCenter = currentPosition || destination;
 
   async function handleAcceptIncident() {
@@ -1754,17 +1579,13 @@ export default function ResponderIncidentDetails() {
 
             <div className="grid grid-cols-2 gap-2">
               <div className="rounded-lg border border-white/60 bg-white/70 px-3 py-2 backdrop-blur-sm">
-                <p className="text-[10px] text-muted-foreground uppercase tracking-wider">
-                  {routeApproximate ? "Distance (Approx)" : "Distance"}
-                </p>
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Distance</p>
                 <p className="text-sm font-semibold text-foreground">
                   {shownDistance !== null ? formatDistance(shownDistance) : "N/A"}
                 </p>
               </div>
               <div className="rounded-lg border border-white/60 bg-white/70 px-3 py-2 backdrop-blur-sm">
-                <p className="text-[10px] text-muted-foreground uppercase tracking-wider">
-                  {routeApproximate ? "ETA (Approx)" : "ETA"}
-                </p>
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wider">ETA</p>
                 <p className="text-sm font-semibold text-foreground">
                   {shownDuration !== null ? formatDuration(shownDuration) : "N/A"}
                 </p>
@@ -1773,9 +1594,7 @@ export default function ResponderIncidentDetails() {
 
             {routeOptions.length > 0 && (
               <div className="space-y-2">
-                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                  {hasGoogleMapsKey ? "Google route optimization" : "Fallback route (straight-line)"}
-                </p>
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Google route optimization</p>
                 <div className="flex gap-2 overflow-x-auto pb-1">
                   {routeOptions.map((route, index) => {
                     const isSelected = selectedRoute?.id === route.id;
@@ -1814,37 +1633,31 @@ export default function ResponderIncidentDetails() {
           </div>
         )}
 
-        {destination && mapCenter ? (
+        {destination && mapCenter && hasGoogleMapsKey ? (
           <div className="h-72 overflow-hidden rounded-xl border border-white/60 bg-white/65 backdrop-blur-sm">
-            {hasGoogleMapsKey ? (
-              <ResponderIncidentGoogleMap
-                mapCenter={mapCenter}
-                currentPosition={currentPosition}
-                currentHeading={currentHeading}
-                currentSpeedMps={currentSpeedMps}
-                destination={destination}
-                destinationLabel={destinationLabel}
-                routeOptions={routeOptions}
-                selectedRouteId={selectedRouteId}
-                fastestRouteId={fastestRouteId}
-                showRouteDetails={showRouteDetails}
-                zoom={13}
-                isFullscreen={false}
-                onRouteSelect={setSelectedRouteId}
-                focusDestinationToken={focusDestinationToken}
-                responderUnit={responderUnit}
-                className="h-full w-full"
-              />
-            ) : (
-              <ResponderIncidentFallbackMap
-                mapCenter={mapCenter}
-                destination={destination}
-                currentPosition={currentPosition}
-                isFullscreen={false}
-                className="relative h-full w-full"
-              />
-            )}
+            <ResponderIncidentGoogleMap
+              mapCenter={mapCenter}
+              currentPosition={currentPosition}
+              currentHeading={currentHeading}
+              currentSpeedMps={currentSpeedMps}
+              destination={destination}
+              destinationLabel={destinationLabel}
+              routeOptions={routeOptions}
+              selectedRouteId={selectedRouteId}
+              fastestRouteId={fastestRouteId}
+              showRouteDetails={showRouteDetails}
+              zoom={13}
+              isFullscreen={false}
+              onRouteSelect={setSelectedRouteId}
+              focusDestinationToken={focusDestinationToken}
+              responderUnit={responderUnit}
+              className="h-full w-full"
+            />
           </div>
+        ) : destination && mapCenter ? (
+          <p className="text-xs text-muted-foreground">
+            Add VITE_GOOGLE_MAPS_API_KEY to enable Google Maps rendering.
+          </p>
         ) : (
           <p className="text-xs text-muted-foreground">Incident coordinates are unavailable.</p>
         )}
@@ -1857,7 +1670,7 @@ export default function ResponderIncidentDetails() {
 
         {!hasGoogleMapsKey && showRouteDetails && (
           <p className="text-xs text-muted-foreground">
-            Google Maps key is missing, so route alternatives use straight-line fallback.
+            Add VITE_GOOGLE_MAPS_API_KEY to enable route alternatives.
           </p>
         )}
       </div>
@@ -1880,38 +1693,28 @@ export default function ResponderIncidentDetails() {
         </button>
       )}
 
-      {isFullscreenMapOpen && destination && mapCenter && typeof document !== "undefined"
+      {isFullscreenMapOpen && destination && mapCenter && hasGoogleMapsKey && typeof document !== "undefined"
         ? createPortal(
         <div className="fixed inset-0 z-[120] bg-black/55 backdrop-blur-[2px] animate-map-overlay">
           <div className="relative h-full w-full animate-map-zoom-in will-change-transform">
-            {hasGoogleMapsKey ? (
-              <ResponderIncidentGoogleMap
-                mapCenter={mapCenter}
-                currentPosition={currentPosition}
-                currentHeading={currentHeading}
-                currentSpeedMps={currentSpeedMps}
-                destination={destination}
-                destinationLabel={destinationLabel}
-                routeOptions={routeOptions}
-                selectedRouteId={selectedRouteId}
-                fastestRouteId={fastestRouteId}
-                showRouteDetails={showRouteDetails}
-                zoom={14}
-                isFullscreen={true}
-                onRouteSelect={setSelectedRouteId}
-                focusDestinationToken={focusDestinationToken}
-                responderUnit={responderUnit}
-                className="absolute inset-0 h-full w-full"
-              />
-            ) : (
-              <ResponderIncidentFallbackMap
-                mapCenter={mapCenter}
-                destination={destination}
-                currentPosition={currentPosition}
-                isFullscreen={true}
-                className="absolute inset-0 h-full w-full bg-slate-950/20"
-              />
-            )}
+            <ResponderIncidentGoogleMap
+              mapCenter={mapCenter}
+              currentPosition={currentPosition}
+              currentHeading={currentHeading}
+              currentSpeedMps={currentSpeedMps}
+              destination={destination}
+              destinationLabel={destinationLabel}
+              routeOptions={routeOptions}
+              selectedRouteId={selectedRouteId}
+              fastestRouteId={fastestRouteId}
+              showRouteDetails={showRouteDetails}
+              zoom={14}
+              isFullscreen={true}
+              onRouteSelect={setSelectedRouteId}
+              focusDestinationToken={focusDestinationToken}
+              responderUnit={responderUnit}
+              className="absolute inset-0 h-full w-full"
+            />
           </div>
 
           <div className="pointer-events-none absolute inset-0 z-[500]">
@@ -1973,17 +1776,13 @@ export default function ResponderIncidentDetails() {
                 )}
                 <div className="grid grid-cols-2 gap-2">
                   <div className="rounded-xl border border-white/70 bg-white/70 px-3 py-2">
-                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                      {routeApproximate ? "ETA (Approx)" : "ETA"}
-                    </p>
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">ETA</p>
                     <p className="text-sm font-bold text-foreground">
                       {routeLoading ? "Calculating..." : shownDuration !== null ? formatDuration(shownDuration) : "N/A"}
                     </p>
                   </div>
                   <div className="rounded-xl border border-white/70 bg-white/70 px-3 py-2">
-                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                      {routeApproximate ? "Distance (Approx)" : "Distance"}
-                    </p>
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Distance</p>
                     <p className="text-sm font-bold text-foreground">
                       {routeLoading ? "Calculating..." : shownDistance !== null ? formatDistance(shownDistance) : "N/A"}
                     </p>
