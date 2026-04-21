@@ -13,8 +13,8 @@ export default function Home() {
     <div className="mx-auto flex max-w-lg flex-col gap-6 bg-[radial-gradient(circle_at_top_left,rgba(249,115,22,0.16),transparent_45%),radial-gradient(circle_at_top_right,rgba(245,158,11,0.12),transparent_42%)] px-4 pt-6 pb-24">
       {/* Header */}
       <div className="text-center">
-        <img
-          src="/assets/banisilan.png"
+          <img
+            src="/assets/logo.png"
           alt="Municipality of Banisilan Seal"
           className="mx-auto mb-3 h-20 w-20 object-contain"
         />

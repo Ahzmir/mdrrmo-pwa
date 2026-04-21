@@ -5,6 +5,8 @@ import {
   RESIDENT_REJECTION_REASON_KEY,
   useAuth,
 } from "@/contexts/AuthContext";
+import { auth, db } from "@/lib/firebase";
+import { doc, serverTimestamp, updateDoc } from "firebase/firestore";
 import {
   Dialog,
   DialogContent,
@@ -136,23 +138,39 @@ export default function ResidentSignUp() {
 
     try {
       setUploadingVerification(true);
+      let residentUid = auth.currentUser?.uid || null;
+
+      if (!residentUid) {
+        await registerResident({
+          fullName: form.fullName.trim(),
+          email: form.email.trim(),
+          password: form.password,
+          phone: form.phone.trim(),
+          address: form.address.trim(),
+          barangay: form.barangay.trim(),
+          city: MUNICIPALITY,
+          idType: form.idType,
+          idNumber: form.idNumber.trim(),
+          validIdUrl: "",
+          residencyProofUrl: "",
+        });
+
+        residentUid = auth.currentUser?.uid || null;
+      }
+
+      if (!residentUid) {
+        throw new Error("Unable to complete account registration. Please try again.");
+      }
+
       const [validIdUrl, residencyProofUrl] = await Promise.all([
         uploadFileToFirebaseStorage(validIdPhoto),
         uploadFileToFirebaseStorage(residencyProof),
       ]);
 
-      await registerResident({
-        fullName: form.fullName.trim(),
-        email: form.email.trim(),
-        password: form.password,
-        phone: form.phone.trim(),
-        address: form.address.trim(),
-        barangay: form.barangay.trim(),
-        city: MUNICIPALITY,
-        idType: form.idType,
-        idNumber: form.idNumber.trim(),
+      await updateDoc(doc(db, "residents", residentUid), {
         validIdUrl,
         residencyProofUrl,
+        updatedAt: serverTimestamp(),
       });
 
       if (typeof window !== "undefined") {

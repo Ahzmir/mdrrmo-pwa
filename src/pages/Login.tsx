@@ -51,7 +51,7 @@ export default function Login() {
         {/* Logo / Header */}
         <div className="rounded-2xl border border-white/45 bg-white/45 p-5 text-center space-y-2 shadow-[0_28px_70px_-44px_rgba(15,23,42,0.55)] backdrop-blur-xl">
           <img
-            src="/assets/banisilan.png"
+            src="/assets/logo.png"
             alt="Municipality of Banisilan Seal"
             className="mx-auto h-20 w-20 object-contain"
           />

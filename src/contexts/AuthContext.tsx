@@ -116,6 +116,56 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | null>(null);
 export const RESIDENT_REJECTED_KEY = "mdrrmo_resident_rejected";
 export const RESIDENT_REJECTION_REASON_KEY = "mdrrmo_resident_rejection_reason";
+const AUTH_CACHE_KEY = "mdrrmo_auth_user_cache_v1";
+
+function isAuthUser(value: unknown): value is AuthUser {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.id === "string" &&
+    typeof row.name === "string" &&
+    typeof row.email === "string" &&
+    (row.role === "resident" || row.role === "responder")
+  );
+}
+
+function readCachedAuthUser(uid: string): AuthUser | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const raw = window.localStorage.getItem(AUTH_CACHE_KEY);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isAuthUser(parsed)) {
+      return null;
+    }
+
+    return parsed.id === uid ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedAuthUser(user: AuthUser | null) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  if (!user) {
+    window.localStorage.removeItem(AUTH_CACHE_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(user));
+}
 
 function mapAuthError(error: unknown) {
   if (error instanceof FirebaseError) {
@@ -349,6 +399,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     await signOut(auth).catch(() => undefined);
     setUser(null);
+    writeCachedAuthUser(null);
 
     if (typeof window !== "undefined" && !window.location.pathname.includes("/signup-resident")) {
       window.location.replace("/signup-resident?reapply=1");
@@ -368,6 +419,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         if (!firebaseUser) {
           setUser(null);
+          writeCachedAuthUser(null);
           setLoading(false);
           return;
         }
@@ -397,7 +449,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setUser(toResidentUser(firebaseUser.uid, residentProfile, firebaseUser.email));
         } catch {
           if (!active) return;
-          setUser(null);
+          const cached = readCachedAuthUser(firebaseUser.uid);
+          setUser(cached);
         } finally {
           if (!active) return;
           setLoading(false);
@@ -414,6 +467,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     };
   }, [forceRejectedResidentSignOut]);
+
+  useEffect(() => {
+    writeCachedAuthUser(user);
+  }, [user]);
 
   useEffect(() => {
     const isResident = user?.role === "resident";
@@ -805,10 +862,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new Error("Email and password are required.");
       }
 
-      if (!data.validIdUrl || !data.residencyProofUrl) {
-        throw new Error("Verification document uploads are required.");
-      }
-
       const credential = await createUserWithEmailAndPassword(auth, normalizedEmail, data.password);
       await updateProfile(credential.user, { displayName: fullName });
 
@@ -822,8 +875,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         address: data.address.trim(),
         barangay: data.barangay.trim(),
         city: municipality,
-        validIdUrl: data.validIdUrl.trim(),
-        residencyProofUrl: data.residencyProofUrl.trim(),
+        validIdUrl: typeof data.validIdUrl === "string" ? data.validIdUrl.trim() : "",
+        residencyProofUrl: typeof data.residencyProofUrl === "string" ? data.residencyProofUrl.trim() : "",
         verified: false,
         verificationStatus: "pending",
         rejectionReason: null,
@@ -876,6 +929,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // If there is no active Firebase session, continue clearing local auth state.
     } finally {
       setUser(null);
+      writeCachedAuthUser(null);
       setLoading(false);
     }
   }, [user]);
